@@ -8,8 +8,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# Optional: bs4 for better text extraction
-from bs4 import BeautifulSoup  # requires beautifulsoup4 in requirements.txt
+from bs4 import BeautifulSoup  # requirements.txt에 beautifulsoup4 필요
 import tldextract
 import plotly.express as px
 
@@ -46,6 +45,7 @@ ul.tight { margin: 0.2rem 0 0.2rem 1.2rem; }
     unsafe_allow_html=True,
 )
 
+
 # -----------------------------
 # Constants
 # -----------------------------
@@ -53,7 +53,7 @@ KST = timezone(timedelta(hours=9))
 UTC = timezone.utc
 
 GDELT_DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
-USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/2.0; +https://streamlit.io)"
+USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/2.1; +https://streamlit.io)"
 REQUEST_TIMEOUT = 10  # seconds
 
 BIAS_ORDER = ["보수", "중도", "진보", "미분류"]
@@ -103,7 +103,7 @@ SECTIONS: List[SectionQuery] = [
 # -----------------------------
 def default_bias_mapping_df() -> pd.DataFrame:
     data = [
-        # Korea (illustrative only; edit as needed)
+        # Korea (illustrative)
         ("chosun.com", "보수"),
         ("donga.com", "보수"),
         ("joongang.co.kr", "중도"),
@@ -130,6 +130,17 @@ def default_bias_mapping_df() -> pd.DataFrame:
 # -----------------------------
 def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def escape_html(s: str) -> str:
+    s = s or ""
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
 
 
 def normalize_domain(url: str) -> Optional[str]:
@@ -216,7 +227,8 @@ def fetch_gdelt_articles(
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return df
+        # 컬럼 없는 빈 DF 방지: 최소 컬럼 세팅
+        return pd.DataFrame(columns=["title", "url", "seendate", "published_utc", "sourceCountry", "language", "domain"])
 
     df["published_utc"] = pd.to_datetime(df["published_utc"], utc=True, errors="coerce")
     df = df.dropna(subset=["published_utc"])
@@ -226,7 +238,7 @@ def fetch_gdelt_articles(
 
 
 # -----------------------------
-# Summarization (3-bullet) + fallback meta
+# Summarization: 3 bullets + fallback meta
 # -----------------------------
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def fetch_page_text_and_meta(url: str) -> Tuple[str, str]:
@@ -257,16 +269,15 @@ def fetch_page_text_and_meta(url: str) -> Tuple[str, str]:
             if meta and meta.get("content"):
                 desc = clean_text(meta.get("content"))
 
-        # extract paragraph text
         paras = soup.find_all("p")
         texts = []
-        for p in paras[:8]:
+        for p in paras[:10]:
             t = clean_text(p.get_text(" ", strip=True))
             if len(t) >= 40:
                 texts.append(t)
-        body = " ".join(texts)
-        body = body[:1800]  # cap
 
+        body = " ".join(texts)
+        body = body[:2000]
         return body, desc
     except Exception:
         return "", ""
@@ -276,14 +287,13 @@ def split_sentences(text: str) -> List[str]:
     text = clean_text(text)
     if not text:
         return []
-    # crude sentence split for both ko/en
-    parts = re.split(r"(?<=[\.\!\?])\s+|(?<=[다요죠]\.)\s+|(?<=\n)\s*", text)
+    parts = re.split(r"(?<=[\.\!\?])\s+|(?<=\n)\s*", text)
     out = []
     for p in parts:
         p = clean_text(p)
         if 25 <= len(p) <= 220:
             out.append(p)
-    # de-dup by normalized
+
     seen = set()
     uniq = []
     for s in out:
@@ -295,42 +305,32 @@ def split_sentences(text: str) -> List[str]:
 
 
 def summarize_3_bullets(page_text: str, meta_desc: str) -> List[str]:
-    """
-    Best-effort 3 bullets:
-    - Prefer extracted sentences from page_text
-    - Fallback to meta_desc if needed
-    """
     sents = split_sentences(page_text)
-    bullets = []
+    bullets: List[str] = []
 
-    # pick first informative sentences, avoid boilerplate
     for s in sents:
         if len(bullets) >= 3:
             break
-        # skip obvious boilerplate
-        if any(k in s.lower() for k in ["cookies", "subscribe", "sign up", "광고", "저작권", "무단", "구독"]):
+        low = s.lower()
+        if any(k in low for k in ["cookies", "subscribe", "sign up", "광고", "저작권", "무단", "구독"]):
             continue
         bullets.append(s)
 
     if len(bullets) < 3 and meta_desc:
-        # split meta desc into chunks
         md = clean_text(meta_desc)
-        if md:
-            # treat as one or split by separators
-            chunks = re.split(r"[•\-\|/]\s*", md)
-            for c in chunks:
-                c = clean_text(c)
-                if 25 <= len(c) <= 220 and c not in bullets:
-                    bullets.append(c)
-                if len(bullets) >= 3:
-                    break
+        chunks = re.split(r"[•\-\|/]\s*", md)
+        for c in chunks:
+            c = clean_text(c)
+            if 25 <= len(c) <= 220 and c not in bullets:
+                bullets.append(c)
+            if len(bullets) >= 3:
+                break
 
-    # final fallback: if still empty, return empty list
     return bullets[:3]
 
 
 # -----------------------------
-# Dedup clustering (token Jaccard)
+# Dedup clustering (token Jaccard) - SAFE VERSION
 # -----------------------------
 STOPWORDS_KO = set(
     "그리고 그러나 또한 때문에 통해 관련 대한 따르면 경우 이번 오늘 내일 어제 기자 단독 속보 "
@@ -350,7 +350,7 @@ def title_tokens(title: str) -> List[str]:
     t = re.sub(r"https?://\S+", " ", t)
     t = re.sub(r"[^0-9a-z가-힣\s]", " ", t)
     toks = [x for x in t.split() if len(x) >= 2]
-    filtered = []
+    filtered: List[str] = []
     for x in toks:
         if re.fullmatch(r"\d+", x):
             filtered.append(x)
@@ -373,39 +373,46 @@ def dedup_by_title_cluster(df: pd.DataFrame, sim_threshold: float = 0.62) -> pd.
     """
     Greedy clustering by title token Jaccard similarity.
     Keep the most recent item as representative for each cluster.
+    SAFE: returns a slice of original df (columns preserved).
     """
-    if df.empty:
+    if df is None or df.empty:
         return df
 
-    df = df.copy()
-    df = df.sort_values("published_utc", ascending=False)
+    # required columns check
+    if "title" not in df.columns or "published_utc" not in df.columns:
+        return df
 
-    kept_rows = []
+    dfx = df.copy().sort_values("published_utc", ascending=False)
+
+    kept_idx: List[int] = []
     cluster_reps: List[set] = []
 
-    for _, row in df.iterrows():
+    for idx, row in dfx.iterrows():
         toks = set(title_tokens(row.get("title", "")))
         if not toks:
             continue
-        is_dup = False
+
+        dup = False
         for rep in cluster_reps:
             if jaccard(toks, rep) >= sim_threshold:
-                is_dup = True
+                dup = True
                 break
-        if not is_dup:
-            kept_rows.append(row)
+
+        if not dup:
+            kept_idx.append(idx)
             cluster_reps.append(toks)
 
-    if not kept_rows:
-        return df.head(0)
-    return pd.DataFrame(kept_rows).reset_index(drop=True)
+    if not kept_idx:
+        return dfx.head(0)  # 컬럼 유지되는 빈 DF
+
+    return dfx.loc[kept_idx].copy()
 
 
 # -----------------------------
 # Bias mapping apply + distribution
 # -----------------------------
 def apply_bias_mapping(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
-    if df.empty:
+    if df is None or df.empty:
         return df
     out = df.copy()
     out["bias"] = out["domain"].map(lambda d: mapping.get((d or "").lower(), "미분류"))
@@ -414,7 +421,7 @@ def apply_bias_mapping(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFram
 
 
 def distribution(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
+    if df is None or df.empty or "bias" not in df.columns:
         return pd.DataFrame(columns=["bias", "count", "share"])
     dist = df.groupby("bias").size().reset_index(name="count")
     total = dist["count"].sum()
@@ -428,7 +435,7 @@ def distribution(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: bool):
     st.subheader(f"{section_name} · Top {len(top_df)}")
-    if top_df.empty:
+    if top_df is None or top_df.empty:
         st.warning("해당 섹션에서 오늘 기사 후보를 찾지 못했습니다. (키워드/범위 조정 필요)")
         return
 
@@ -438,20 +445,18 @@ def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: boo
         domain = row.get("domain") or "unknown"
         bias = row.get("bias") or "미분류"
 
-        pub_kst = None
+        pub_str = ""
         try:
             pub_kst = pd.to_datetime(row.get("published_utc"), utc=True).tz_convert(KST)
+            pub_str = pub_kst.strftime("%H:%M (KST)")
         except Exception:
             pass
-        pub_str = pub_kst.strftime("%H:%M (KST)") if pub_kst is not None else ""
 
         bullets: List[str] = row.get("bullets") or []
         meta_desc = row.get("meta_desc") or ""
 
         if enable_summary:
             if bullets:
-                summary_html = "<ul class='tight'>" + "".join([f"<li>{st.html.escape(b)}</li>" for b in bullets]) + "</ul>"
-                # streamlit doesn't provide st.html.escape; do minimal safe escape:
                 summary_html = "<ul class='tight'>" + "".join([f"<li>{escape_html(b)}</li>" for b in bullets]) + "</ul>"
             elif meta_desc:
                 summary_html = f"<small class='muted'>{escape_html(meta_desc)}</small>"
@@ -465,9 +470,9 @@ def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: boo
 <div class="card">
   <div class="kv">
     <span class="badge">#{idx+1}</span>
-    <span>성향: <b>{bias}</b></span>
-    <span>도메인: <b>{domain}</b></span>
-    <span>발행: <b>{pub_str}</b></span>
+    <span>성향: <b>{escape_html(bias)}</b></span>
+    <span>도메인: <b>{escape_html(domain)}</b></span>
+    <span>발행: <b>{escape_html(pub_str)}</b></span>
   </div>
   <h4>{escape_html(title)}</h4>
   <div>
@@ -482,17 +487,6 @@ def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: boo
 """,
             unsafe_allow_html=True,
         )
-
-
-def escape_html(s: str) -> str:
-    s = s or ""
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&#39;")
-    )
 
 
 # -----------------------------
@@ -591,10 +585,6 @@ st.caption("수집 기간: 오늘 00:00 ~ 현재 (KST)")
 
 section_cfg_map: Dict[str, SectionQuery] = {s.section: s for s in SECTIONS}
 
-# We will store per-section:
-# - candidates (deduped)
-# - top list (top_n)
-# - bias dist
 results: Dict[str, Dict[str, pd.DataFrame]] = {}
 
 with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
@@ -602,6 +592,7 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
         cfg = section_cfg_map[sec_name]
         q = build_section_query(region, cfg, extra_keyword)
 
+        # 1) fetch
         try:
             df = fetch_gdelt_articles(
                 query=q,
@@ -610,41 +601,49 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
                 max_records=int(candidate_pool),
             )
         except Exception:
-            df = pd.DataFrame()
+            df = pd.DataFrame(columns=["title", "url", "seendate", "published_utc", "sourceCountry", "language", "domain"])
 
-        # Domestic safeguard
-        if region == "국내" and not df.empty:
+        # 2) domestic safeguard
+        if region == "국내" and not df.empty and "sourceCountry" in df.columns:
             df = df[df["sourceCountry"].fillna("").str.upper() == "KOR"]
 
-        # Apply bias mapping to candidates (for dist)
+        # 3) apply bias mapping on candidates
         df = apply_bias_mapping(df, mapping_dict)
 
-        # Dedup clustering for better Top picks
+        # 4) dedup clustering (safe)
         df_dedup = dedup_by_title_cluster(df, sim_threshold=float(sim_threshold))
 
-        # Pick Top N from deduped candidates (prefer recency)
-        df_dedup = df_dedup.sort_values("published_utc", ascending=False)
+        # 5) 방어: published_utc 컬럼이 없으면 빈 DF(컬럼 보존)로 강제
+        if df_dedup is None or "published_utc" not in df_dedup.columns:
+            df_dedup = df.head(0).copy()
+
+        # 6) sort (safe)
+        if not df_dedup.empty:
+            df_dedup = df_dedup.sort_values("published_utc", ascending=False)
+
+        # 7) top pick
         top_df = df_dedup.head(int(top_n)).copy()
 
-        # Summaries (3 bullets)
+        # 8) summaries
         if enable_summary and not top_df.empty:
             top_df["bullets"] = None
             top_df["meta_desc"] = ""
             for i in range(len(top_df)):
-                url = top_df.iloc[i]["url"]
-                time.sleep(0.12)  # polite delay
+                url = top_df.iloc[i].get("url")
+                time.sleep(0.12)
                 page_text, meta_desc = fetch_page_text_and_meta(url)
                 bullets = summarize_3_bullets(page_text, meta_desc)
                 top_df.iat[i, top_df.columns.get_loc("bullets")] = bullets
                 top_df.iat[i, top_df.columns.get_loc("meta_desc")] = meta_desc or ""
 
-        # Distribution computed on deduped candidates (more honest)
+        # 9) distribution on deduped candidates
         dist_df = distribution(df_dedup)
 
         results[sec_name] = {
             "candidates": df_dedup,
             "top": top_df,
             "dist": dist_df,
+            "query": pd.DataFrame([{"query": q}]),
         }
 
 # -----------------------------
@@ -653,21 +652,19 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
 tabs = st.tabs(selected_sections)
 for tab, sec_name in zip(tabs, selected_sections):
     with tab:
-        cfg = section_cfg_map[sec_name]
-        q = build_section_query(region, cfg, extra_keyword)
-        st.markdown(f"<small class='muted'>사용 쿼리: {clean_text(q)}</small>", unsafe_allow_html=True)
+        q = results[sec_name]["query"].iloc[0]["query"]
+        st.markdown(f"<small class='muted'>사용 쿼리: {escape_html(clean_text(q))}</small>", unsafe_allow_html=True)
 
-        # Dist chart
-        dist_df = results[sec_name]["dist"]
         cands = results[sec_name]["candidates"]
+        dist_df = results[sec_name]["dist"]
 
         c1, c2, c3 = st.columns(3)
-        c1.metric("후보 기사(중복 제거 후)", f"{len(cands):,}")
-        unknown_share = dist_df.loc[dist_df["bias"] == "미분류", "share"].sum() if not dist_df.empty else 0
+        c1.metric("후보 기사(중복 제거 후)", f"{len(cands):,}" if cands is not None else "0")
+        unknown_share = dist_df.loc[dist_df["bias"] == "미분류", "share"].sum() if dist_df is not None and not dist_df.empty else 0
         c2.metric("미분류 비율", f"{unknown_share*100:.1f}%")
-        c3.metric("고유 도메인", f"{cands['domain'].nunique(dropna=True):,}" if not cands.empty else "0")
+        c3.metric("고유 도메인", f"{cands['domain'].nunique(dropna=True):,}" if cands is not None and not cands.empty and "domain" in cands.columns else "0")
 
-        if not dist_df.empty:
+        if dist_df is not None and not dist_df.empty:
             fig = px.bar(dist_df, x="bias", y="count", text=dist_df["share"].map(lambda x: f"{x*100:.1f}%"))
             fig.update_layout(xaxis_title="성향", yaxis_title="기사 수", showlegend=False, height=320)
             st.plotly_chart(fig, use_container_width=True)
@@ -675,16 +672,14 @@ for tab, sec_name in zip(tabs, selected_sections):
             st.info("성향 분포를 만들 데이터가 없습니다.")
 
         st.divider()
-
-        # Top list
         render_top_list(sec_name, results[sec_name]["top"], enable_summary)
 
         with st.expander("진단: 후보 기사(중복 제거 후) 미리보기", expanded=False):
-            st.dataframe(
-                results[sec_name]["candidates"][["published_utc", "bias", "domain", "title", "url"]].head(50),
-                use_container_width=True,
-                height=420,
-            )
+            if cands is None or cands.empty:
+                st.write("후보 기사가 없습니다.")
+            else:
+                cols = [c for c in ["published_utc", "bias", "domain", "title", "url"] if c in cands.columns]
+                st.dataframe(cands[cols].head(60), use_container_width=True, height=420)
 
 st.caption(
     "주의: (1) 섹션 분류는 섹션별 대표 키워드 기반이며, (2) 요약은 웹페이지 접근 가능 범위에서만 생성됩니다. "
