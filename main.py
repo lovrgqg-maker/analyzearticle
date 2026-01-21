@@ -7,15 +7,18 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 import streamlit as st
-from bs4 import BeautifulSoup
+
+# Optional: bs4 for better text extraction
+from bs4 import BeautifulSoup  # requires beautifulsoup4 in requirements.txt
 import tldextract
+import plotly.express as px
 
 
 # -----------------------------
 # Page Config
 # -----------------------------
 st.set_page_config(
-    page_title="오늘 섹션별 Top 5 (국내/해외)",
+    page_title="오늘 섹션별 Top 5 + 성향 분포 (국내/해외)",
     page_icon="🗞️",
     layout="wide",
 )
@@ -37,6 +40,7 @@ small.muted { color: rgba(49,51,63,.65); }
 .kv span { font-size: 0.92rem; color: rgba(49,51,63,.72); }
 .badge { display:inline-block; padding:2px 8px; border-radius: 999px; border:1px solid rgba(49,51,63,.18); font-size:.82rem;}
 hr.soft { border: none; border-top: 1px solid rgba(49,51,63,.10); margin: 14px 0; }
+ul.tight { margin: 0.2rem 0 0.2rem 1.2rem; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -49,8 +53,10 @@ KST = timezone(timedelta(hours=9))
 UTC = timezone.utc
 
 GDELT_DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
-USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/1.0; +https://streamlit.io)"
+USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/2.0; +https://streamlit.io)"
 REQUEST_TIMEOUT = 10  # seconds
+
+BIAS_ORDER = ["보수", "중도", "진보", "미분류"]
 
 
 # -----------------------------
@@ -93,7 +99,34 @@ SECTIONS: List[SectionQuery] = [
 
 
 # -----------------------------
-# Helpers
+# Bias mapping (starter; user-editable)
+# -----------------------------
+def default_bias_mapping_df() -> pd.DataFrame:
+    data = [
+        # Korea (illustrative only; edit as needed)
+        ("chosun.com", "보수"),
+        ("donga.com", "보수"),
+        ("joongang.co.kr", "중도"),
+        ("mk.co.kr", "중도"),
+        ("yonhapnews.co.kr", "중도"),
+        ("hani.co.kr", "진보"),
+        ("khan.co.kr", "진보"),
+        # Global (illustrative)
+        ("reuters.com", "중도"),
+        ("apnews.com", "중도"),
+        ("bbc.co.uk", "중도"),
+        ("economist.com", "중도"),
+        ("foxnews.com", "보수"),
+        ("wsj.com", "보수"),
+        ("nytimes.com", "진보"),
+        ("washingtonpost.com", "진보"),
+        ("cnn.com", "진보"),
+    ]
+    return pd.DataFrame(data, columns=["domain", "bias"])
+
+
+# -----------------------------
+# Helpers: text / parsing
 # -----------------------------
 def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
@@ -124,7 +157,24 @@ def kst_today_range_utc() -> Tuple[datetime, datetime]:
     return start_kst.astimezone(UTC), now_kst.astimezone(UTC)
 
 
-@st.cache_data(ttl=60 * 10, show_spinner=False)  # 10 minutes
+def build_section_query(region: str, section_cfg: SectionQuery, extra_keyword: str) -> str:
+    extra = clean_text(extra_keyword)
+    extra_part = f'("{extra}")' if extra else ""
+
+    if region == "국내":
+        base = "sourceCountry:KOR"
+        sec = section_cfg.domestic_query
+        return f"{base} {sec} {extra_part}".strip()
+
+    base = "language:eng -sourceCountry:KOR"
+    sec = section_cfg.overseas_query
+    return f"{base} {sec} {extra_part}".strip()
+
+
+# -----------------------------
+# GDELT fetch
+# -----------------------------
+@st.cache_data(ttl=60 * 10, show_spinner=False)
 def fetch_gdelt_articles(
     query: str,
     start_dt_utc: datetime,
@@ -175,10 +225,18 @@ def fetch_gdelt_articles(
     return df
 
 
-@st.cache_data(ttl=60 * 60, show_spinner=False)  # 1 hour
-def fetch_meta_description(url: str) -> Optional[str]:
+# -----------------------------
+# Summarization (3-bullet) + fallback meta
+# -----------------------------
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def fetch_page_text_and_meta(url: str) -> Tuple[str, str]:
+    """
+    Returns: (best_effort_text, best_effort_description)
+    - best_effort_text: extracted paragraph text (limited)
+    - best_effort_description: og:description or meta description
+    """
     if not url:
-        return None
+        return "", ""
     headers = {
         "User-Agent": USER_AGENT,
         "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -186,55 +244,188 @@ def fetch_meta_description(url: str) -> Optional[str]:
     try:
         r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         if r.status_code >= 400:
-            return None
+            return "", ""
         soup = BeautifulSoup(r.text, "lxml")
 
+        desc = ""
         og = soup.find("meta", property="og:description")
         if og and og.get("content"):
-            return clean_text(og.get("content"))
+            desc = clean_text(og.get("content"))
 
-        meta = soup.find("meta", attrs={"name": "description"})
-        if meta and meta.get("content"):
-            return clean_text(meta.get("content"))
+        if not desc:
+            meta = soup.find("meta", attrs={"name": "description"})
+            if meta and meta.get("content"):
+                desc = clean_text(meta.get("content"))
 
-        p = soup.find("p")
-        if p and p.get_text(strip=True):
-            return clean_text(p.get_text(strip=True))[:260]
+        # extract paragraph text
+        paras = soup.find_all("p")
+        texts = []
+        for p in paras[:8]:
+            t = clean_text(p.get_text(" ", strip=True))
+            if len(t) >= 40:
+                texts.append(t)
+        body = " ".join(texts)
+        body = body[:1800]  # cap
 
-        return None
+        return body, desc
     except Exception:
-        return None
+        return "", ""
 
 
-def build_section_query(region: str, section_cfg: SectionQuery, extra_keyword: str) -> str:
+def split_sentences(text: str) -> List[str]:
+    text = clean_text(text)
+    if not text:
+        return []
+    # crude sentence split for both ko/en
+    parts = re.split(r"(?<=[\.\!\?])\s+|(?<=[다요죠]\.)\s+|(?<=\n)\s*", text)
+    out = []
+    for p in parts:
+        p = clean_text(p)
+        if 25 <= len(p) <= 220:
+            out.append(p)
+    # de-dup by normalized
+    seen = set()
+    uniq = []
+    for s in out:
+        key = re.sub(r"[^0-9A-Za-z가-힣]+", "", s).lower()
+        if key and key not in seen:
+            seen.add(key)
+            uniq.append(s)
+    return uniq
+
+
+def summarize_3_bullets(page_text: str, meta_desc: str) -> List[str]:
     """
-    - 국내: sourceCountry:KOR + 한국어 섹션 키워드 (+ optional extra keyword)
-    - 해외: language:eng -sourceCountry:KOR + 영어 섹션 키워드 (+ optional extra keyword)
+    Best-effort 3 bullets:
+    - Prefer extracted sentences from page_text
+    - Fallback to meta_desc if needed
     """
-    extra = clean_text(extra_keyword)
-    extra_part = f'("{extra}")' if extra else ""
+    sents = split_sentences(page_text)
+    bullets = []
 
-    if region == "국내":
-        base = "sourceCountry:KOR"
-        sec = section_cfg.domestic_query
-        return f"{base} {sec} {extra_part}".strip()
+    # pick first informative sentences, avoid boilerplate
+    for s in sents:
+        if len(bullets) >= 3:
+            break
+        # skip obvious boilerplate
+        if any(k in s.lower() for k in ["cookies", "subscribe", "sign up", "광고", "저작권", "무단", "구독"]):
+            continue
+        bullets.append(s)
 
-    base = "language:eng -sourceCountry:KOR"
-    sec = section_cfg.overseas_query
-    return f"{base} {sec} {extra_part}".strip()
+    if len(bullets) < 3 and meta_desc:
+        # split meta desc into chunks
+        md = clean_text(meta_desc)
+        if md:
+            # treat as one or split by separators
+            chunks = re.split(r"[•\-\|/]\s*", md)
+            for c in chunks:
+                c = clean_text(c)
+                if 25 <= len(c) <= 220 and c not in bullets:
+                    bullets.append(c)
+                if len(bullets) >= 3:
+                    break
+
+    # final fallback: if still empty, return empty list
+    return bullets[:3]
 
 
-def rank_and_pick_top(df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+# -----------------------------
+# Dedup clustering (token Jaccard)
+# -----------------------------
+STOPWORDS_KO = set(
+    "그리고 그러나 또한 때문에 통해 관련 대한 따르면 경우 이번 오늘 내일 어제 기자 단독 속보 "
+    "영상 사진 발표 밝혔다 말했다 예정 진행 가능 확대 감소 증가 정부 국회 대통령 "
+    .split()
+)
+STOPWORDS_EN = set(
+    "the a an and or but if then than this that those these to of in on for with without "
+    "as from by at is are was were be been being it its into about after before over under "
+    "says said say will would could should may might "
+    .split()
+)
+
+
+def title_tokens(title: str) -> List[str]:
+    t = clean_text(title).lower()
+    t = re.sub(r"https?://\S+", " ", t)
+    t = re.sub(r"[^0-9a-z가-힣\s]", " ", t)
+    toks = [x for x in t.split() if len(x) >= 2]
+    filtered = []
+    for x in toks:
+        if re.fullmatch(r"\d+", x):
+            filtered.append(x)
+            continue
+        if x in STOPWORDS_EN or x in STOPWORDS_KO:
+            continue
+        filtered.append(x)
+    return filtered[:32]
+
+
+def jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def dedup_by_title_cluster(df: pd.DataFrame, sim_threshold: float = 0.62) -> pd.DataFrame:
     """
-    GDELT HybridRel 기반 반환을 받되, 화면에서는 최신성을 조금 더 반영.
+    Greedy clustering by title token Jaccard similarity.
+    Keep the most recent item as representative for each cluster.
     """
     if df.empty:
         return df
+
     df = df.copy()
     df = df.sort_values("published_utc", ascending=False)
-    return df.head(top_n)
+
+    kept_rows = []
+    cluster_reps: List[set] = []
+
+    for _, row in df.iterrows():
+        toks = set(title_tokens(row.get("title", "")))
+        if not toks:
+            continue
+        is_dup = False
+        for rep in cluster_reps:
+            if jaccard(toks, rep) >= sim_threshold:
+                is_dup = True
+                break
+        if not is_dup:
+            kept_rows.append(row)
+            cluster_reps.append(toks)
+
+    if not kept_rows:
+        return df.head(0)
+    return pd.DataFrame(kept_rows).reset_index(drop=True)
 
 
+# -----------------------------
+# Bias mapping apply + distribution
+# -----------------------------
+def apply_bias_mapping(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out["bias"] = out["domain"].map(lambda d: mapping.get((d or "").lower(), "미분류"))
+    out["bias"] = out["bias"].where(out["bias"].isin(["보수", "중도", "진보"]), "미분류")
+    return out
+
+
+def distribution(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["bias", "count", "share"])
+    dist = df.groupby("bias").size().reset_index(name="count")
+    total = dist["count"].sum()
+    dist["share"] = dist["count"] / total if total else 0
+    dist["bias"] = pd.Categorical(dist["bias"], categories=BIAS_ORDER, ordered=True)
+    return dist.sort_values("bias")
+
+
+# -----------------------------
+# Rendering
+# -----------------------------
 def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: bool):
     st.subheader(f"{section_name} · Top {len(top_df)}")
     if top_df.empty:
@@ -245,29 +436,47 @@ def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: boo
         title = row.get("title") or "(제목 없음)"
         url = row.get("url") or ""
         domain = row.get("domain") or "unknown"
-        pub_kst = row.get("published_utc").tz_convert(KST) if hasattr(row.get("published_utc"), "tz_convert") else None
+        bias = row.get("bias") or "미분류"
+
+        pub_kst = None
+        try:
+            pub_kst = pd.to_datetime(row.get("published_utc"), utc=True).tz_convert(KST)
+        except Exception:
+            pass
         pub_str = pub_kst.strftime("%H:%M (KST)") if pub_kst is not None else ""
 
-        summary = row.get("summary") or ""
+        bullets: List[str] = row.get("bullets") or []
+        meta_desc = row.get("meta_desc") or ""
+
+        if enable_summary:
+            if bullets:
+                summary_html = "<ul class='tight'>" + "".join([f"<li>{st.html.escape(b)}</li>" for b in bullets]) + "</ul>"
+                # streamlit doesn't provide st.html.escape; do minimal safe escape:
+                summary_html = "<ul class='tight'>" + "".join([f"<li>{escape_html(b)}</li>" for b in bullets]) + "</ul>"
+            elif meta_desc:
+                summary_html = f"<small class='muted'>{escape_html(meta_desc)}</small>"
+            else:
+                summary_html = "<small class='muted'>요약을 불러오지 못했습니다(사이트 차단/메타정보/본문 부재 가능).</small>"
+        else:
+            summary_html = "<small class='muted'>요약 기능이 꺼져 있습니다.</small>"
 
         st.markdown(
             f"""
 <div class="card">
   <div class="kv">
     <span class="badge">#{idx+1}</span>
+    <span>성향: <b>{bias}</b></span>
     <span>도메인: <b>{domain}</b></span>
     <span>발행: <b>{pub_str}</b></span>
   </div>
-  <h4>{title}</h4>
+  <h4>{escape_html(title)}</h4>
   <div>
     <a href="{url}" target="_blank" rel="noopener noreferrer">{url}</a>
   </div>
   <hr class="soft"/>
   <div>
-    <b>핵심 요약</b><br/>
-    {"<small class='muted'>요약 기능이 꺼져 있습니다.</small>" if not enable_summary else (
-        "<small class='muted'>요약을 불러오지 못했습니다(사이트 차단/메타정보 부재 가능).</small>" if not summary else summary
-    )}
+    <b>핵심 요약 (3 bullets)</b><br/>
+    {summary_html}
   </div>
 </div>
 """,
@@ -275,11 +484,22 @@ def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: boo
         )
 
 
+def escape_html(s: str) -> str:
+    s = s or ""
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
 # -----------------------------
 # UI
 # -----------------------------
-st.title("오늘 섹션별 주요 뉴스 Top 5")
-st.caption("국내/해외 선택 후, 섹션별(정치·경제·사회·국제·스포츠)로 오늘 Top 5를 요약 정리합니다. (데이터: GDELT)")
+st.title("오늘 섹션별 주요 뉴스 Top 5 + 성향 분포")
+st.caption("국내/해외 선택 후 섹션별 Top 5를 ‘중복 제거 + 3줄 요약’으로 개선하고, 섹션별 성향 분포를 함께 보여줍니다. (데이터: GDELT)")
 
 with st.sidebar:
     st.header("1) 범위 선택")
@@ -291,12 +511,7 @@ with st.sidebar:
     selected_sections = st.multiselect(
         "분석할 섹션(복수 선택 가능)",
         options=section_names,
-        default=section_names,  # 기본: 전체 섹션
-    )
-
-    st.markdown(
-        '<small class="muted">섹션은 GDELT에 “편집국 섹션”이 직접 제공되지 않으므로, 섹션별 대표 키워드 쿼리로 구성합니다.</small>',
-        unsafe_allow_html=True,
+        default=section_names,
     )
 
     st.divider()
@@ -311,23 +526,57 @@ with st.sidebar:
 
     candidate_pool = st.number_input(
         "섹션별 후보 기사 수(수집량)",
-        min_value=50,
-        max_value=400,
-        value=180,
+        min_value=60,
+        max_value=500,
+        value=220,
         step=10,
         help="각 섹션에서 Top N을 뽑기 전 GDELT에서 가져오는 후보 기사 수입니다.",
     )
 
-    enable_summary = st.toggle(
-        "기사 핵심요약(메타디스크립션) 가져오기",
-        value=True,
-        help="사이트 차단/속도 저하가 있을 수 있습니다. 끄면 타이틀 중심으로만 표시합니다.",
+    st.divider()
+    st.header("품질 옵션")
+    enable_summary = st.toggle("3줄 핵심 bullet 요약", value=True)
+    sim_threshold = st.slider(
+        "중복 제거 유사도 임계값(Jaccard)",
+        min_value=0.45,
+        max_value=0.80,
+        value=0.62,
+        step=0.01,
+        help="값이 높을수록 ‘거의 같은 제목’만 중복으로 제거합니다. 0.60~0.70 권장.",
     )
+
+    st.divider()
+    st.header("성향 매핑")
+    uploaded = st.file_uploader("매핑 CSV 업로드 (domain,bias)", type=["csv"])
+    if uploaded is not None:
+        try:
+            map_df = pd.read_csv(uploaded)[["domain", "bias"]].dropna()
+        except Exception:
+            st.warning("CSV를 읽지 못했습니다. columns: domain,bias 형태인지 확인하세요.")
+            map_df = default_bias_mapping_df()
+    else:
+        map_df = default_bias_mapping_df()
+
+    edited_map_df = st.data_editor(
+        map_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "domain": st.column_config.TextColumn("domain"),
+            "bias": st.column_config.SelectboxColumn("bias", options=["보수", "중도", "진보"]),
+        },
+    )
+
+    mapping_dict = {
+        str(r["domain"]).strip().lower(): str(r["bias"]).strip()
+        for _, r in edited_map_df.dropna().iterrows()
+        if str(r.get("domain", "")).strip() and str(r.get("bias", "")).strip()
+    }
 
     run = st.button("오늘 섹션별 Top 뉴스 생성", type="primary", use_container_width=True)
 
 if not run:
-    st.info("좌측에서 범위와 섹션을 선택한 뒤, ‘오늘 섹션별 Top 뉴스 생성’을 눌러 주세요.")
+    st.info("좌측에서 범위/섹션/옵션을 선택한 뒤 실행하세요.")
     st.stop()
 
 if not selected_sections:
@@ -340,12 +589,15 @@ today_kst = datetime.now(KST).strftime("%Y-%m-%d")
 st.markdown(f"### {today_kst} · {region} · 섹션별 Top {int(top_n)}")
 st.caption("수집 기간: 오늘 00:00 ~ 현재 (KST)")
 
-# Build a quick lookup for section configs
 section_cfg_map: Dict[str, SectionQuery] = {s.section: s for s in SECTIONS}
 
-results: Dict[str, pd.DataFrame] = {}
+# We will store per-section:
+# - candidates (deduped)
+# - top list (top_n)
+# - bias dist
+results: Dict[str, Dict[str, pd.DataFrame]] = {}
 
-with st.spinner("섹션별 기사 후보를 수집 중입니다..."):
+with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
     for sec_name in selected_sections:
         cfg = section_cfg_map[sec_name]
         q = build_section_query(region, cfg, extra_keyword)
@@ -357,42 +609,84 @@ with st.spinner("섹션별 기사 후보를 수집 중입니다..."):
                 end_dt_utc=end_utc,
                 max_records=int(candidate_pool),
             )
-        except requests.HTTPError as e:
-            st.error(f"[{sec_name}] GDELT 요청 실패(HTTPError): {e}")
-            df = pd.DataFrame()
-        except Exception as e:
-            st.error(f"[{sec_name}] GDELT 요청 실패: {e}")
+        except Exception:
             df = pd.DataFrame()
 
-        # (국내) 안전장치: sourceCountry=KOR만 유지
+        # Domestic safeguard
         if region == "국내" and not df.empty:
             df = df[df["sourceCountry"].fillna("").str.upper() == "KOR"]
 
-        top_df = rank_and_pick_top(df, int(top_n))
+        # Apply bias mapping to candidates (for dist)
+        df = apply_bias_mapping(df, mapping_dict)
 
-        # Summaries (optional) - only for selected top rows
+        # Dedup clustering for better Top picks
+        df_dedup = dedup_by_title_cluster(df, sim_threshold=float(sim_threshold))
+
+        # Pick Top N from deduped candidates (prefer recency)
+        df_dedup = df_dedup.sort_values("published_utc", ascending=False)
+        top_df = df_dedup.head(int(top_n)).copy()
+
+        # Summaries (3 bullets)
         if enable_summary and not top_df.empty:
-            top_df = top_df.copy()
-            top_df["summary"] = ""
+            top_df["bullets"] = None
+            top_df["meta_desc"] = ""
             for i in range(len(top_df)):
                 url = top_df.iloc[i]["url"]
                 time.sleep(0.12)  # polite delay
-                top_df.iat[i, top_df.columns.get_loc("summary")] = fetch_meta_description(url) or ""
+                page_text, meta_desc = fetch_page_text_and_meta(url)
+                bullets = summarize_3_bullets(page_text, meta_desc)
+                top_df.iat[i, top_df.columns.get_loc("bullets")] = bullets
+                top_df.iat[i, top_df.columns.get_loc("meta_desc")] = meta_desc or ""
 
-        results[sec_name] = top_df
+        # Distribution computed on deduped candidates (more honest)
+        dist_df = distribution(df_dedup)
 
+        results[sec_name] = {
+            "candidates": df_dedup,
+            "top": top_df,
+            "dist": dist_df,
+        }
+
+# -----------------------------
 # Render: tabs per section
+# -----------------------------
 tabs = st.tabs(selected_sections)
 for tab, sec_name in zip(tabs, selected_sections):
     with tab:
-        # show query diagnostics
         cfg = section_cfg_map[sec_name]
         q = build_section_query(region, cfg, extra_keyword)
         st.markdown(f"<small class='muted'>사용 쿼리: {clean_text(q)}</small>", unsafe_allow_html=True)
 
-        render_top_list(sec_name, results.get(sec_name, pd.DataFrame()), enable_summary)
+        # Dist chart
+        dist_df = results[sec_name]["dist"]
+        cands = results[sec_name]["candidates"]
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("후보 기사(중복 제거 후)", f"{len(cands):,}")
+        unknown_share = dist_df.loc[dist_df["bias"] == "미분류", "share"].sum() if not dist_df.empty else 0
+        c2.metric("미분류 비율", f"{unknown_share*100:.1f}%")
+        c3.metric("고유 도메인", f"{cands['domain'].nunique(dropna=True):,}" if not cands.empty else "0")
+
+        if not dist_df.empty:
+            fig = px.bar(dist_df, x="bias", y="count", text=dist_df["share"].map(lambda x: f"{x*100:.1f}%"))
+            fig.update_layout(xaxis_title="성향", yaxis_title="기사 수", showlegend=False, height=320)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("성향 분포를 만들 데이터가 없습니다.")
+
+        st.divider()
+
+        # Top list
+        render_top_list(sec_name, results[sec_name]["top"], enable_summary)
+
+        with st.expander("진단: 후보 기사(중복 제거 후) 미리보기", expanded=False):
+            st.dataframe(
+                results[sec_name]["candidates"][["published_utc", "bias", "domain", "title", "url"]].head(50),
+                use_container_width=True,
+                height=420,
+            )
 
 st.caption(
-    "주의: ‘Top’은 GDELT 수집/정렬(HybridRel)과 최신성 기준의 휴리스틱으로 선정된 대표 기사입니다. "
-    "포털/편집국의 ‘메인 Top’과 완전히 동일하지 않을 수 있습니다."
+    "주의: (1) 섹션 분류는 섹션별 대표 키워드 기반이며, (2) 요약은 웹페이지 접근 가능 범위에서만 생성됩니다. "
+    "정확도를 더 높이려면 ‘언론사별 RSS/섹션 URL’ 기반 수집으로 확장하는 것을 권장합니다."
 )
