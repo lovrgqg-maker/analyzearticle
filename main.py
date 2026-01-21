@@ -8,7 +8,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from bs4 import BeautifulSoup  # requirements.txt에 beautifulsoup4 필요
+from bs4 import BeautifulSoup
 import tldextract
 import plotly.express as px
 
@@ -17,7 +17,7 @@ import plotly.express as px
 # Page Config
 # -----------------------------
 st.set_page_config(
-    page_title="오늘 섹션별 Top 5 + 성향 분포 (국내/해외)",
+    page_title="섹션별 Top 5 + 성향 분포 (직전 24시간)",
     page_icon="🗞️",
     layout="wide",
 )
@@ -45,7 +45,6 @@ ul.tight { margin: 0.2rem 0 0.2rem 1.2rem; }
     unsafe_allow_html=True,
 )
 
-
 # -----------------------------
 # Constants
 # -----------------------------
@@ -53,7 +52,7 @@ KST = timezone(timedelta(hours=9))
 UTC = timezone.utc
 
 GDELT_DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
-USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/2.1; +https://streamlit.io)"
+USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/2.2; +https://streamlit.io)"
 REQUEST_TIMEOUT = 10  # seconds
 
 BIAS_ORDER = ["보수", "중도", "진보", "미분류"]
@@ -162,18 +161,25 @@ def parse_seendate_utc(s: str) -> Optional[datetime]:
         return None
 
 
-def kst_today_range_utc() -> Tuple[datetime, datetime]:
-    now_kst = datetime.now(KST)
-    start_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
-    return start_kst.astimezone(UTC), now_kst.astimezone(UTC)
+def rolling_24h_range_utc() -> Tuple[datetime, datetime]:
+    """
+    검색 실행 시점 기준 직전 24시간 범위(UTC).
+    """
+    end_utc = datetime.now(UTC)
+    start_utc = end_utc - timedelta(hours=24)
+    return start_utc, end_utc
 
 
 def build_section_query(region: str, section_cfg: SectionQuery, extra_keyword: str) -> str:
+    """
+    국내: language:kor + 섹션 키워드 (+ optional extra keyword)
+    해외: language:eng -sourceCountry:KOR + 섹션 키워드 (+ optional extra keyword)
+    """
     extra = clean_text(extra_keyword)
     extra_part = f'("{extra}")' if extra else ""
 
     if region == "국내":
-        base = "sourceCountry:KOR"
+        base = "language:kor"
         sec = section_cfg.domestic_query
         return f"{base} {sec} {extra_part}".strip()
 
@@ -225,11 +231,10 @@ def fetch_gdelt_articles(
             }
         )
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        # 컬럼 없는 빈 DF 방지: 최소 컬럼 세팅
+    if not rows:
         return pd.DataFrame(columns=["title", "url", "seendate", "published_utc", "sourceCountry", "language", "domain"])
 
+    df = pd.DataFrame(rows)
     df["published_utc"] = pd.to_datetime(df["published_utc"], utc=True, errors="coerce")
     df = df.dropna(subset=["published_utc"])
     df = df[df["title"] != ""]
@@ -242,11 +247,6 @@ def fetch_gdelt_articles(
 # -----------------------------
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def fetch_page_text_and_meta(url: str) -> Tuple[str, str]:
-    """
-    Returns: (best_effort_text, best_effort_description)
-    - best_effort_text: extracted paragraph text (limited)
-    - best_effort_description: og:description or meta description
-    """
     if not url:
         return "", ""
     headers = {
@@ -288,7 +288,7 @@ def split_sentences(text: str) -> List[str]:
     if not text:
         return []
     parts = re.split(r"(?<=[\.\!\?])\s+|(?<=\n)\s*", text)
-    out = []
+    out: List[str] = []
     for p in parts:
         p = clean_text(p)
         if 25 <= len(p) <= 220:
@@ -330,7 +330,7 @@ def summarize_3_bullets(page_text: str, meta_desc: str) -> List[str]:
 
 
 # -----------------------------
-# Dedup clustering (token Jaccard) - SAFE VERSION
+# Dedup clustering (token Jaccard) - SAFE
 # -----------------------------
 STOPWORDS_KO = set(
     "그리고 그러나 또한 때문에 통해 관련 대한 따르면 경우 이번 오늘 내일 어제 기자 단독 속보 "
@@ -370,15 +370,8 @@ def jaccard(a: set, b: set) -> float:
 
 
 def dedup_by_title_cluster(df: pd.DataFrame, sim_threshold: float = 0.62) -> pd.DataFrame:
-    """
-    Greedy clustering by title token Jaccard similarity.
-    Keep the most recent item as representative for each cluster.
-    SAFE: returns a slice of original df (columns preserved).
-    """
     if df is None or df.empty:
         return df
-
-    # required columns check
     if "title" not in df.columns or "published_utc" not in df.columns:
         return df
 
@@ -403,7 +396,7 @@ def dedup_by_title_cluster(df: pd.DataFrame, sim_threshold: float = 0.62) -> pd.
             cluster_reps.append(toks)
 
     if not kept_idx:
-        return dfx.head(0)  # 컬럼 유지되는 빈 DF
+        return dfx.head(0)
 
     return dfx.loc[kept_idx].copy()
 
@@ -436,7 +429,7 @@ def distribution(df: pd.DataFrame) -> pd.DataFrame:
 def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: bool):
     st.subheader(f"{section_name} · Top {len(top_df)}")
     if top_df is None or top_df.empty:
-        st.warning("해당 섹션에서 오늘 기사 후보를 찾지 못했습니다. (키워드/범위 조정 필요)")
+        st.warning("해당 섹션에서 기사 후보를 찾지 못했습니다. (기간/키워드/범위 조정 필요)")
         return
 
     for idx, row in top_df.reset_index(drop=True).iterrows():
@@ -448,7 +441,7 @@ def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: boo
         pub_str = ""
         try:
             pub_kst = pd.to_datetime(row.get("published_utc"), utc=True).tz_convert(KST)
-            pub_str = pub_kst.strftime("%H:%M (KST)")
+            pub_str = pub_kst.strftime("%Y-%m-%d %H:%M (KST)")
         except Exception:
             pass
 
@@ -492,7 +485,7 @@ def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: boo
 # -----------------------------
 # UI
 # -----------------------------
-st.title("오늘 섹션별 주요 뉴스 Top 5 + 성향 분포")
+st.title("섹션별 주요 뉴스 Top 5 + 성향 분포")
 st.caption("국내/해외 선택 후 섹션별 Top 5를 ‘중복 제거 + 3줄 요약’으로 개선하고, 섹션별 성향 분포를 함께 보여줍니다. (데이터: GDELT)")
 
 with st.sidebar:
@@ -567,7 +560,10 @@ with st.sidebar:
         if str(r.get("domain", "")).strip() and str(r.get("bias", "")).strip()
     }
 
-    run = st.button("오늘 섹션별 Top 뉴스 생성", type="primary", use_container_width=True)
+    st.divider()
+    debug = st.toggle("디버그 표시(쿼리/건수)", value=False)
+
+    run = st.button("직전 24시간 섹션별 Top 뉴스 생성", type="primary", use_container_width=True)
 
 if not run:
     st.info("좌측에서 범위/섹션/옵션을 선택한 뒤 실행하세요.")
@@ -577,14 +573,14 @@ if not selected_sections:
     st.warning("최소 1개 섹션을 선택해야 합니다.")
     st.stop()
 
-start_utc, end_utc = kst_today_range_utc()
-today_kst = datetime.now(KST).strftime("%Y-%m-%d")
+start_utc, end_utc = rolling_24h_range_utc()
+start_kst = start_utc.astimezone(KST)
+end_kst = end_utc.astimezone(KST)
 
-st.markdown(f"### {today_kst} · {region} · 섹션별 Top {int(top_n)}")
-st.caption("수집 기간: 오늘 00:00 ~ 현재 (KST)")
+st.markdown(f"### {region} · 섹션별 Top {int(top_n)}")
+st.caption(f"수집 기간: {start_kst.strftime('%Y-%m-%d %H:%M')} ~ {end_kst.strftime('%Y-%m-%d %H:%M')} (KST, 직전 24시간)")
 
 section_cfg_map: Dict[str, SectionQuery] = {s.section: s for s in SECTIONS}
-
 results: Dict[str, Dict[str, pd.DataFrame]] = {}
 
 with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
@@ -592,7 +588,6 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
         cfg = section_cfg_map[sec_name]
         q = build_section_query(region, cfg, extra_keyword)
 
-        # 1) fetch
         try:
             df = fetch_gdelt_articles(
                 query=q,
@@ -603,28 +598,26 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
         except Exception:
             df = pd.DataFrame(columns=["title", "url", "seendate", "published_utc", "sourceCountry", "language", "domain"])
 
-        # 2) domestic safeguard
-        if region == "국내" and not df.empty and "sourceCountry" in df.columns:
-            df = df[df["sourceCountry"].fillna("").str.upper() == "KOR"]
+        if debug:
+            st.write(f"[DEBUG] {sec_name} query = {q}")
+            st.write(f"[DEBUG] {sec_name} fetched rows = {len(df)}")
 
-        # 3) apply bias mapping on candidates
+        # 성향 매핑
         df = apply_bias_mapping(df, mapping_dict)
 
-        # 4) dedup clustering (safe)
+        # 중복 제거(컬럼 보존 안전)
         df_dedup = dedup_by_title_cluster(df, sim_threshold=float(sim_threshold))
 
-        # 5) 방어: published_utc 컬럼이 없으면 빈 DF(컬럼 보존)로 강제
+        # 방어: published_utc 없으면 빈 DF로
         if df_dedup is None or "published_utc" not in df_dedup.columns:
             df_dedup = df.head(0).copy()
 
-        # 6) sort (safe)
         if not df_dedup.empty:
             df_dedup = df_dedup.sort_values("published_utc", ascending=False)
 
-        # 7) top pick
         top_df = df_dedup.head(int(top_n)).copy()
 
-        # 8) summaries
+        # 3줄 요약
         if enable_summary and not top_df.empty:
             top_df["bullets"] = None
             top_df["meta_desc"] = ""
@@ -636,7 +629,6 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
                 top_df.iat[i, top_df.columns.get_loc("bullets")] = bullets
                 top_df.iat[i, top_df.columns.get_loc("meta_desc")] = meta_desc or ""
 
-        # 9) distribution on deduped candidates
         dist_df = distribution(df_dedup)
 
         results[sec_name] = {
@@ -646,9 +638,7 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
             "query": pd.DataFrame([{"query": q}]),
         }
 
-# -----------------------------
-# Render: tabs per section
-# -----------------------------
+# Render tabs
 tabs = st.tabs(selected_sections)
 for tab, sec_name in zip(tabs, selected_sections):
     with tab:
@@ -678,7 +668,7 @@ for tab, sec_name in zip(tabs, selected_sections):
             if cands is None or cands.empty:
                 st.write("후보 기사가 없습니다.")
             else:
-                cols = [c for c in ["published_utc", "bias", "domain", "title", "url"] if c in cands.columns]
+                cols = [c for c in ["published_utc", "bias", "domain", "title", "url", "language", "sourceCountry"] if c in cands.columns]
                 st.dataframe(cands[cols].head(60), use_container_width=True, height=420)
 
 st.caption(
