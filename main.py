@@ -17,7 +17,7 @@ import plotly.express as px
 # Page Config
 # -----------------------------
 st.set_page_config(
-    page_title="섹션별 Top 5 + 성향 분포 (전날 기준)",
+    page_title="섹션별 Top 5 + 성향 분포 (전날 기준 / Fallback Query)",
     page_icon="🗞️",
     layout="wide",
 )
@@ -52,10 +52,12 @@ KST = timezone(timedelta(hours=9))
 UTC = timezone.utc
 
 GDELT_DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
-USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/2.3; +https://streamlit.io)"
-REQUEST_TIMEOUT = 10  # seconds
+USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/2.4; +https://streamlit.io)"
+REQUEST_TIMEOUT = 12  # seconds
 
 BIAS_ORDER = ["보수", "중도", "진보", "미분류"]
+
+EMPTY_COLUMNS = ["title", "url", "seendate", "published_utc", "sourceCountry", "language", "domain"]
 
 
 # -----------------------------
@@ -64,6 +66,7 @@ BIAS_ORDER = ["보수", "중도", "진보", "미분류"]
 @dataclass(frozen=True)
 class SectionQuery:
     section: str
+    # NOTE: DOC 검색 안정성을 위해 국내/해외 모두 영어 키워드 기반으로 구성
     domestic_query: str
     overseas_query: str
 
@@ -71,28 +74,28 @@ class SectionQuery:
 SECTIONS: List[SectionQuery] = [
     SectionQuery(
         section="정치",
-        domestic_query='(정치 OR 정부 OR 국회 OR 대통령 OR 여당 OR 야당 OR 총선 OR 대선 OR 선거 OR 공천)',
-        overseas_query='(politics OR government OR parliament OR congress OR president OR election OR campaign)',
+        domestic_query="(politics OR government OR parliament OR national assembly OR president OR election OR ruling party OR opposition)",
+        overseas_query="(politics OR government OR parliament OR congress OR president OR election OR campaign)",
     ),
     SectionQuery(
         section="경제",
-        domestic_query='(경제 OR 증시 OR 주식 OR 코스피 OR 코스닥 OR 환율 OR 금리 OR 물가 OR 인플레이션 OR 기업 OR 산업 OR 반도체)',
-        overseas_query='(economy OR markets OR stocks OR inflation OR interest rates OR central bank OR currency OR business OR industry OR semiconductor)',
+        domestic_query="(economy OR markets OR stocks OR exchange rate OR interest rates OR inflation OR prices OR companies OR industry OR semiconductor)",
+        overseas_query="(economy OR markets OR stocks OR inflation OR interest rates OR central bank OR currency OR business OR industry OR semiconductor)",
     ),
     SectionQuery(
         section="사회",
-        domestic_query='(사회 OR 사건 OR 사고 OR 범죄 OR 재난 OR 교육 OR 의료 OR 복지 OR 노동 OR 파업 OR 법원 OR 검찰 OR 경찰)',
-        overseas_query='(society OR crime OR accident OR disaster OR education OR health OR welfare OR labor OR strike OR court OR police)',
+        domestic_query="(crime OR accident OR disaster OR education OR health OR welfare OR labor OR strike OR court OR prosecutors OR police)",
+        overseas_query="(society OR crime OR accident OR disaster OR education OR health OR welfare OR labor OR strike OR court OR police)",
     ),
     SectionQuery(
         section="국제",
-        domestic_query='(국제 OR 외교 OR 정상회담 OR UN OR 유엔 OR 미국 OR 중국 OR 일본 OR 러시아 OR 우크라이나 OR 중동 OR 가자)',
-        overseas_query='(world OR international OR diplomacy OR summit OR UN OR Ukraine OR Russia OR China OR Japan OR Middle East OR Gaza)',
+        domestic_query="(diplomacy OR summit OR UN OR United Nations OR United States OR China OR Japan OR Russia OR Ukraine OR Middle East OR Gaza)",
+        overseas_query="(world OR international OR diplomacy OR summit OR UN OR Ukraine OR Russia OR China OR Japan OR Middle East OR Gaza)",
     ),
     SectionQuery(
         section="스포츠",
-        domestic_query='(스포츠 OR 축구 OR 야구 OR 농구 OR 배구 OR 골프 OR e스포츠 OR 올림픽 OR 월드컵 OR KBO OR K리그)',
-        overseas_query='(sports OR football OR soccer OR baseball OR basketball OR Olympics OR World Cup OR NBA OR MLB OR NHL)',
+        domestic_query="(sports OR soccer OR football OR baseball OR basketball OR volleyball OR golf OR esports OR Olympics OR World Cup)",
+        overseas_query="(sports OR football OR soccer OR baseball OR basketball OR Olympics OR World Cup OR NBA OR MLB OR NHL)",
     ),
 ]
 
@@ -125,7 +128,7 @@ def default_bias_mapping_df() -> pd.DataFrame:
 
 
 # -----------------------------
-# Helpers: text / parsing
+# Helpers
 # -----------------------------
 def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
@@ -163,8 +166,7 @@ def parse_seendate_utc(s: str) -> Optional[datetime]:
 
 def yesterday_kst_range_utc() -> Tuple[datetime, datetime]:
     """
-    '현재 날짜 - 1일' 기준 KST 00:00~24:00(=오늘 00:00) 범위를 UTC로 변환.
-    예) 오늘이 1/21(KST)이라면, 1/20 00:00 ~ 1/21 00:00 (KST)
+    전날 00:00 ~ 오늘 00:00 (KST) 범위를 UTC로 변환.
     """
     now_kst = datetime.now(KST)
     today_start_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -173,24 +175,40 @@ def yesterday_kst_range_utc() -> Tuple[datetime, datetime]:
     return start_kst.astimezone(UTC), end_kst.astimezone(UTC)
 
 
-def build_section_query(region: str, section_cfg: SectionQuery, extra_keyword: str) -> str:
+# -----------------------------
+# Query builder: candidate queries with fallback
+# -----------------------------
+def build_section_query_candidates(region: str, section_cfg: SectionQuery, extra_keyword: str) -> List[str]:
     """
-    IMPORTANT:
-    - GDELT DOC 언어 제한은 `sourcelang:` 연산자를 사용하는 것이 일반적입니다.
+    - 1차: extra_keyword 포함
+    - 2차: extra_keyword 제거 (0건 방지 fallback)
+    - 언어 연산자 sourcelang 값이 케이스/코드에 민감할 수 있어 다중 후보를 순차 시도
     """
     extra = clean_text(extra_keyword)
-    extra_part = f'("{extra}")' if extra else ""
+
+    extra_parts = []
+    if extra:
+        extra_parts.append(f'("{extra}")')
+    extra_parts.append("")  # fallback: extra 제거
+
+    queries: List[str] = []
 
     if region == "국내":
-        # 핵심 수정: language:kor -> sourcelang:kor
-        base = "sourcelang:kor"
-        sec = section_cfg.domestic_query
-        return f"{base} {sec} {extra_part}".strip()
+        # 한국어 소스 + 영어 키워드
+        lang_candidates = ["sourcelang:kor", "sourcelang:korean", "sourcelang:Korean"]
+        for lang in lang_candidates:
+            for extra_part in extra_parts:
+                q = f"{lang} {section_cfg.domestic_query} {extra_part}".strip()
+                queries.append(q)
+        return queries
 
-    # 해외: 영어권 매체로 제한(필요하면 country 옵션을 추가로 확장 가능)
-    base = "sourcelang:english"
-    sec = section_cfg.overseas_query
-    return f"{base} {sec} {extra_part}".strip()
+    # 해외: 영어 소스 + 영어 키워드
+    lang_candidates = ["sourcelang:eng", "sourcelang:english", "sourcelang:English"]
+    for lang in lang_candidates:
+        for extra_part in extra_parts:
+            q = f"{lang} {section_cfg.overseas_query} {extra_part}".strip()
+            queries.append(q)
+    return queries
 
 
 # -----------------------------
@@ -237,7 +255,7 @@ def fetch_gdelt_articles(
         )
 
     if not rows:
-        return pd.DataFrame(columns=["title", "url", "seendate", "published_utc", "sourceCountry", "language", "domain"])
+        return pd.DataFrame(columns=EMPTY_COLUMNS)
 
     df = pd.DataFrame(rows)
     df["published_utc"] = pd.to_datetime(df["published_utc"], utc=True, errors="coerce")
@@ -490,7 +508,7 @@ def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: boo
 # UI
 # -----------------------------
 st.title("섹션별 주요 뉴스 Top 5 + 성향 분포 (전날 기준)")
-st.caption("전날(어제) 00:00~24:00(KST)의 섹션별 Top 5를 ‘중복 제거 + 3줄 요약’으로 정리하고, 섹션별 성향 분포를 함께 보여줍니다. (데이터: GDELT DOC API)")
+st.caption("전날(어제) 00:00~24:00(KST) 기준 섹션별 Top 5를 ‘중복 제거 + 3줄 요약’으로 정리하고, 섹션별 성향 분포를 함께 보여줍니다. (GDELT DOC API)")
 
 with st.sidebar:
     st.header("1) 범위 선택")
@@ -510,7 +528,7 @@ with st.sidebar:
     extra_keyword = st.text_input(
         "추가 키워드(선택)",
         value="",
-        help="예: ‘탄소세’, ‘철강’, ‘원전’ 등을 넣으면 해당 이슈 중심으로 섹션별 Top 5가 구성됩니다.",
+        help="주의: DOC 검색은 영어 키워드가 안정적입니다. 한글 키워드는 0건이 될 수 있어 자동 fallback이 동작합니다.",
     )
 
     top_n = st.number_input("섹션별 Top N", min_value=3, max_value=10, value=5, step=1)
@@ -521,7 +539,7 @@ with st.sidebar:
         max_value=500,
         value=250,
         step=10,
-        help="각 섹션에서 Top N을 뽑기 전 GDELT에서 가져오는 후보 기사 수입니다.",
+        help="Top N을 뽑기 전 GDELT에서 가져오는 후보 기사 수입니다.",
     )
 
     st.divider()
@@ -533,7 +551,7 @@ with st.sidebar:
         max_value=0.80,
         value=0.62,
         step=0.01,
-        help="값이 높을수록 ‘거의 같은 제목’만 중복으로 제거합니다. 0.60~0.70 권장.",
+        help="값이 높을수록 ‘거의 같은 제목’만 중복으로 제거합니다.",
     )
 
     st.divider()
@@ -584,27 +602,63 @@ end_kst = end_utc.astimezone(KST)
 st.markdown(f"### {region} · 섹션별 Top {int(top_n)}")
 st.caption(f"수집 기간: {start_kst.strftime('%Y-%m-%d %H:%M')} ~ {end_kst.strftime('%Y-%m-%d %H:%M')} (KST, 전날 기준)")
 
+
+# -----------------------------
+# Connectivity self-test
+# -----------------------------
+with st.expander("진단: GDELT 연결 테스트", expanded=False):
+    try:
+        # 아주 단순한 테스트 쿼리 (전날 범위 내)
+        test_df = fetch_gdelt_articles(
+            query='sourcelang:eng "Korea"',
+            start_dt_utc=start_utc,
+            end_dt_utc=end_utc,
+            max_records=5,
+        )
+        st.write("GDELT 응답 rows:", len(test_df))
+        if not test_df.empty:
+            st.dataframe(test_df[["published_utc", "domain", "title", "url"]], use_container_width=True)
+        else:
+            st.info("테스트 쿼리도 0건입니다. (환경/네트워크 문제 또는 기간/쿼리 문제 가능)")
+    except Exception as e:
+        st.error(f"GDELT 호출 실패: {repr(e)}")
+        st.info("이 경우, Streamlit Cloud의 outbound 네트워크/DNS/TLS 이슈 가능성이 큽니다.")
+
+
+# -----------------------------
+# Main processing
+# -----------------------------
 section_cfg_map: Dict[str, SectionQuery] = {s.section: s for s in SECTIONS}
 results: Dict[str, Dict[str, pd.DataFrame]] = {}
 
 with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
     for sec_name in selected_sections:
         cfg = section_cfg_map[sec_name]
-        q = build_section_query(region, cfg, extra_keyword)
 
-        try:
-            df = fetch_gdelt_articles(
-                query=q,
-                start_dt_utc=start_utc,
-                end_dt_utc=end_utc,
-                max_records=int(candidate_pool),
-            )
-        except Exception:
-            df = pd.DataFrame(columns=["title", "url", "seendate", "published_utc", "sourceCountry", "language", "domain"])
+        query_candidates = build_section_query_candidates(region, cfg, extra_keyword)
 
-        if debug:
-            st.write(f"[DEBUG] {sec_name} query = {q}")
-            st.write(f"[DEBUG] {sec_name} fetched rows = {len(df)}")
+        df = pd.DataFrame(columns=EMPTY_COLUMNS)
+        used_q = query_candidates[0]
+
+        for cand_q in query_candidates:
+            used_q = cand_q
+            try:
+                df_try = fetch_gdelt_articles(
+                    query=cand_q,
+                    start_dt_utc=start_utc,
+                    end_dt_utc=end_utc,
+                    max_records=int(candidate_pool),
+                )
+            except Exception:
+                df_try = pd.DataFrame(columns=EMPTY_COLUMNS)
+
+            if debug:
+                st.write(f"[DEBUG] {sec_name} query = {cand_q}")
+                st.write(f"[DEBUG] {sec_name} fetched rows = {len(df_try)}")
+
+            if not df_try.empty:
+                df = df_try
+                break
 
         df = apply_bias_mapping(df, mapping_dict)
 
@@ -635,14 +689,18 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
             "candidates": df_dedup,
             "top": top_df,
             "dist": dist_df,
-            "query": pd.DataFrame([{"query": q}]),
+            "query": pd.DataFrame([{"query": used_q}]),
         }
 
+
+# -----------------------------
+# Render tabs
+# -----------------------------
 tabs = st.tabs(selected_sections)
 for tab, sec_name in zip(tabs, selected_sections):
     with tab:
-        q = results[sec_name]["query"].iloc[0]["query"]
-        st.markdown(f"<small class='muted'>사용 쿼리: {escape_html(clean_text(q))}</small>", unsafe_allow_html=True)
+        used_q = results[sec_name]["query"].iloc[0]["query"]
+        st.markdown(f"<small class='muted'>최종 사용 쿼리: {escape_html(clean_text(used_q))}</small>", unsafe_allow_html=True)
 
         cands = results[sec_name]["candidates"]
         dist_df = results[sec_name]["dist"]
@@ -671,6 +729,6 @@ for tab, sec_name in zip(tabs, selected_sections):
                 st.dataframe(cands[cols].head(60), use_container_width=True, height=420)
 
 st.caption(
-    "주의: (1) 섹션 분류는 섹션별 대표 키워드 기반이며, (2) 요약은 웹페이지 접근 가능 범위에서만 생성됩니다. "
-    "정확도를 더 높이려면 ‘언론사별 RSS/섹션 URL’ 기반 수집으로 확장하는 것을 권장합니다."
+    "주의: (1) 섹션 분류는 키워드 기반이며, (2) 요약은 웹페이지 접근 가능 범위에서만 생성됩니다. "
+    "후보가 계속 0이면 expander의 ‘GDELT 연결 테스트’ 결과(에러/0건 여부)를 기준으로 환경 문제인지 판단하세요."
 )
