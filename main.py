@@ -17,7 +17,7 @@ import plotly.express as px
 # Page Config
 # -----------------------------
 st.set_page_config(
-    page_title="섹션별 Top 5 + 성향 분포 (직전 24시간)",
+    page_title="섹션별 Top 5 + 성향 분포 (전날 기준)",
     page_icon="🗞️",
     layout="wide",
 )
@@ -52,7 +52,7 @@ KST = timezone(timedelta(hours=9))
 UTC = timezone.utc
 
 GDELT_DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
-USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/2.2; +https://streamlit.io)"
+USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/2.3; +https://streamlit.io)"
 REQUEST_TIMEOUT = 10  # seconds
 
 BIAS_ORDER = ["보수", "중도", "진보", "미분류"]
@@ -161,29 +161,34 @@ def parse_seendate_utc(s: str) -> Optional[datetime]:
         return None
 
 
-def rolling_24h_range_utc() -> Tuple[datetime, datetime]:
+def yesterday_kst_range_utc() -> Tuple[datetime, datetime]:
     """
-    검색 실행 시점 기준 직전 24시간 범위(UTC).
+    '현재 날짜 - 1일' 기준 KST 00:00~24:00(=오늘 00:00) 범위를 UTC로 변환.
+    예) 오늘이 1/21(KST)이라면, 1/20 00:00 ~ 1/21 00:00 (KST)
     """
-    end_utc = datetime.now(UTC)
-    start_utc = end_utc - timedelta(hours=24)
-    return start_utc, end_utc
+    now_kst = datetime.now(KST)
+    today_start_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_kst = today_start_kst - timedelta(days=1)
+    end_kst = today_start_kst
+    return start_kst.astimezone(UTC), end_kst.astimezone(UTC)
 
 
 def build_section_query(region: str, section_cfg: SectionQuery, extra_keyword: str) -> str:
     """
-    국내: language:kor + 섹션 키워드 (+ optional extra keyword)
-    해외: language:eng -sourceCountry:KOR + 섹션 키워드 (+ optional extra keyword)
+    IMPORTANT:
+    - GDELT DOC 언어 제한은 `sourcelang:` 연산자를 사용하는 것이 일반적입니다.
     """
     extra = clean_text(extra_keyword)
     extra_part = f'("{extra}")' if extra else ""
 
     if region == "국내":
-        base = "language:kor"
+        # 핵심 수정: language:kor -> sourcelang:kor
+        base = "sourcelang:kor"
         sec = section_cfg.domestic_query
         return f"{base} {sec} {extra_part}".strip()
 
-    base = "language:eng -sourceCountry:KOR"
+    # 해외: 영어권 매체로 제한(필요하면 country 옵션을 추가로 확장 가능)
+    base = "sourcelang:english"
     sec = section_cfg.overseas_query
     return f"{base} {sec} {extra_part}".strip()
 
@@ -276,8 +281,7 @@ def fetch_page_text_and_meta(url: str) -> Tuple[str, str]:
             if len(t) >= 40:
                 texts.append(t)
 
-        body = " ".join(texts)
-        body = body[:2000]
+        body = " ".join(texts)[:2000]
         return body, desc
     except Exception:
         return "", ""
@@ -485,8 +489,8 @@ def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: boo
 # -----------------------------
 # UI
 # -----------------------------
-st.title("섹션별 주요 뉴스 Top 5 + 성향 분포")
-st.caption("국내/해외 선택 후 섹션별 Top 5를 ‘중복 제거 + 3줄 요약’으로 개선하고, 섹션별 성향 분포를 함께 보여줍니다. (데이터: GDELT)")
+st.title("섹션별 주요 뉴스 Top 5 + 성향 분포 (전날 기준)")
+st.caption("전날(어제) 00:00~24:00(KST)의 섹션별 Top 5를 ‘중복 제거 + 3줄 요약’으로 정리하고, 섹션별 성향 분포를 함께 보여줍니다. (데이터: GDELT DOC API)")
 
 with st.sidebar:
     st.header("1) 범위 선택")
@@ -515,7 +519,7 @@ with st.sidebar:
         "섹션별 후보 기사 수(수집량)",
         min_value=60,
         max_value=500,
-        value=220,
+        value=250,
         step=10,
         help="각 섹션에서 Top N을 뽑기 전 GDELT에서 가져오는 후보 기사 수입니다.",
     )
@@ -563,7 +567,7 @@ with st.sidebar:
     st.divider()
     debug = st.toggle("디버그 표시(쿼리/건수)", value=False)
 
-    run = st.button("직전 24시간 섹션별 Top 뉴스 생성", type="primary", use_container_width=True)
+    run = st.button("전날 섹션별 Top 뉴스 생성", type="primary", use_container_width=True)
 
 if not run:
     st.info("좌측에서 범위/섹션/옵션을 선택한 뒤 실행하세요.")
@@ -573,12 +577,12 @@ if not selected_sections:
     st.warning("최소 1개 섹션을 선택해야 합니다.")
     st.stop()
 
-start_utc, end_utc = rolling_24h_range_utc()
+start_utc, end_utc = yesterday_kst_range_utc()
 start_kst = start_utc.astimezone(KST)
 end_kst = end_utc.astimezone(KST)
 
 st.markdown(f"### {region} · 섹션별 Top {int(top_n)}")
-st.caption(f"수집 기간: {start_kst.strftime('%Y-%m-%d %H:%M')} ~ {end_kst.strftime('%Y-%m-%d %H:%M')} (KST, 직전 24시간)")
+st.caption(f"수집 기간: {start_kst.strftime('%Y-%m-%d %H:%M')} ~ {end_kst.strftime('%Y-%m-%d %H:%M')} (KST, 전날 기준)")
 
 section_cfg_map: Dict[str, SectionQuery] = {s.section: s for s in SECTIONS}
 results: Dict[str, Dict[str, pd.DataFrame]] = {}
@@ -602,13 +606,10 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
             st.write(f"[DEBUG] {sec_name} query = {q}")
             st.write(f"[DEBUG] {sec_name} fetched rows = {len(df)}")
 
-        # 성향 매핑
         df = apply_bias_mapping(df, mapping_dict)
 
-        # 중복 제거(컬럼 보존 안전)
         df_dedup = dedup_by_title_cluster(df, sim_threshold=float(sim_threshold))
 
-        # 방어: published_utc 없으면 빈 DF로
         if df_dedup is None or "published_utc" not in df_dedup.columns:
             df_dedup = df.head(0).copy()
 
@@ -617,7 +618,6 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
 
         top_df = df_dedup.head(int(top_n)).copy()
 
-        # 3줄 요약
         if enable_summary and not top_df.empty:
             top_df["bullets"] = None
             top_df["meta_desc"] = ""
@@ -638,7 +638,6 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
             "query": pd.DataFrame([{"query": q}]),
         }
 
-# Render tabs
 tabs = st.tabs(selected_sections)
 for tab, sec_name in zip(tabs, selected_sections):
     with tab:
