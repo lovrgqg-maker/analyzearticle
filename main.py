@@ -17,7 +17,7 @@ import plotly.express as px
 # Page Config
 # -----------------------------
 st.set_page_config(
-    page_title="섹션별 Top 5 + 성향 분포 (전날 기준 / Debug 강화)",
+    page_title="섹션별 Top 5 + 성향 분포 (전날 기준 / Parse Fix)",
     page_icon="🗞️",
     layout="wide",
 )
@@ -53,11 +53,11 @@ KST = timezone(timedelta(hours=9))
 UTC = timezone.utc
 
 GDELT_DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
-USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/2.5; +https://streamlit.io)"
+USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/2.6; +https://streamlit.io)"
 REQUEST_TIMEOUT = 15  # seconds
 
 BIAS_ORDER = ["보수", "중도", "진보", "미분류"]
-EMPTY_COLUMNS = ["title", "url", "seendate", "published_utc", "sourceCountry", "language", "domain"]
+EMPTY_COLUMNS = ["title", "url", "seendate", "published_raw", "published_utc", "sourceCountry", "language", "domain"]
 
 
 # -----------------------------
@@ -70,7 +70,6 @@ class SectionQuery:
     overseas_query: str
 
 
-# NOTE: DOC 검색 안정성을 위해 국내/해외 모두 영어 키워드 기반
 SECTIONS: List[SectionQuery] = [
     SectionQuery(
         section="정치",
@@ -153,19 +152,7 @@ def normalize_domain(url: str) -> Optional[str]:
         return None
 
 
-def parse_seendate_utc(s: str) -> Optional[datetime]:
-    if not s or not isinstance(s, str):
-        return None
-    try:
-        return datetime.strptime(s, "%Y%m%d%H%M%S").replace(tzinfo=UTC)
-    except Exception:
-        return None
-
-
 def yesterday_kst_range_utc() -> Tuple[datetime, datetime]:
-    """
-    전날 00:00 ~ 오늘 00:00 (KST) 범위를 UTC로 변환
-    """
     now_kst = datetime.now(KST)
     today_start_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
     start_kst = today_start_kst - timedelta(days=1)
@@ -174,16 +161,15 @@ def yesterday_kst_range_utc() -> Tuple[datetime, datetime]:
 
 
 # -----------------------------
-# Query builder: candidates with fallback
+# Query builder
 # -----------------------------
 def build_section_query_candidates(region: str, section_cfg: SectionQuery, extra_keyword: str) -> List[str]:
     extra = clean_text(extra_keyword)
 
-    # extra 포함 -> (0이면) extra 제거
     extra_parts = []
     if extra:
         extra_parts.append(f'("{extra}")')
-    extra_parts.append("")
+    extra_parts.append("")  # fallback extra 제거
 
     queries: List[str] = []
 
@@ -197,7 +183,6 @@ def build_section_query_candidates(region: str, section_cfg: SectionQuery, extra
             queries.append(f"{section_cfg.domestic_query} {extra_part}".strip())
         return queries
 
-    # 해외
     lang_candidates = ["sourcelang:eng", "sourcelang:english", "sourcelang:English"]
     for lang in lang_candidates:
         for extra_part in extra_parts:
@@ -208,7 +193,38 @@ def build_section_query_candidates(region: str, section_cfg: SectionQuery, extra
 
 
 # -----------------------------
-# GDELT fetch (Debug 강화)
+# Robust datetime parsing
+# -----------------------------
+def pick_published_raw(article: Dict[str, Any]) -> Optional[str]:
+    """
+    DOC 응답에서 시간 필드가 seendate 외에도 다른 이름으로 올 수 있어 후보를 순차 시도.
+    """
+    for key in ["seendate", "seenDate", "datetime", "date", "published", "publicationDate"]:
+        v = article.get(key)
+        if v:
+            return str(v)
+    return article.get("seendate")
+
+
+def parse_published_utc(raw: Optional[str]) -> Optional[pd.Timestamp]:
+    """
+    - 14자리 숫자(YYYYMMDDHHMMSS)도 처리
+    - ISO8601 등은 pandas.to_datetime으로 처리
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+    # 14자리 숫자 형태
+    if re.fullmatch(r"\d{14}", s):
+        ts = pd.to_datetime(s, format="%Y%m%d%H%M%S", utc=True, errors="coerce")
+        return ts if pd.notna(ts) else None
+    # 그 외(ISO8601 등)
+    ts = pd.to_datetime(s, utc=True, errors="coerce")
+    return ts if pd.notna(ts) else None
+
+
+# -----------------------------
+# GDELT fetch (핵심 수정: published 파싱)
 # -----------------------------
 @st.cache_data(ttl=60 * 10, show_spinner=False)
 def fetch_gdelt_articles(
@@ -217,20 +233,14 @@ def fetch_gdelt_articles(
     end_dt_utc: datetime,
     max_records: int,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Returns (df, debug_info)
-    debug_info includes status_code, final_url, top-level keys, error/message (if present), articles_count
-    """
     def fmt(dt: datetime) -> str:
         return dt.astimezone(UTC).strftime("%Y%m%d%H%M%S")
 
     params = {
         "query": query,
-        # IMPORTANT: mode는 예시대로 소문자 사용
         "mode": "artlist",
         "format": "json",
         "maxrecords": int(max_records),
-        # 날짜 확인 편의: 최신순
         "sort": "datedesc",
         "startdatetime": fmt(start_dt_utc),
         "enddatetime": fmt(end_dt_utc),
@@ -238,39 +248,49 @@ def fetch_gdelt_articles(
 
     headers = {"User-Agent": USER_AGENT}
 
-    debug_info: Dict[str, Any] = {
+    dbg: Dict[str, Any] = {
         "status_code": None,
         "final_url": None,
         "top_keys": None,
         "error": None,
         "message": None,
         "articles_count": None,
+        "sample_article_keys": None,
+        "sample_published_raw": None,
     }
 
     r = requests.get(GDELT_DOC_ENDPOINT, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
-    debug_info["status_code"] = r.status_code
-    debug_info["final_url"] = r.url
-
+    dbg["status_code"] = r.status_code
+    dbg["final_url"] = r.url
     r.raise_for_status()
-    data = r.json()
 
-    if isinstance(data, dict):
-        debug_info["top_keys"] = sorted(list(data.keys()))
-        debug_info["error"] = data.get("error")
-        debug_info["message"] = data.get("message")
-        debug_info["articles_count"] = len(data.get("articles", []) or [])
-    else:
-        debug_info["top_keys"] = [type(data).__name__]
+    data = r.json()
+    dbg["top_keys"] = sorted(list(data.keys())) if isinstance(data, dict) else [type(data).__name__]
+    dbg["error"] = data.get("error") if isinstance(data, dict) else None
+    dbg["message"] = data.get("message") if isinstance(data, dict) else None
+
+    articles = (data.get("articles", []) or []) if isinstance(data, dict) else []
+    dbg["articles_count"] = len(articles)
+
+    if articles:
+        dbg["sample_article_keys"] = sorted(list(articles[0].keys()))
+        raw0 = pick_published_raw(articles[0]) or ""
+        dbg["sample_published_raw"] = raw0
 
     rows = []
-    for a in (data.get("articles", []) or []):
+    for a in articles:
         url = a.get("url")
+        title = clean_text(a.get("title") or "")
+        published_raw = pick_published_raw(a)
+        published_ts = parse_published_utc(published_raw)
+
         rows.append(
             {
-                "title": clean_text(a.get("title") or ""),
+                "title": title,
                 "url": url,
                 "seendate": a.get("seendate"),
-                "published_utc": parse_seendate_utc(a.get("seendate")),
+                "published_raw": published_raw,
+                "published_utc": published_ts,
                 "sourceCountry": a.get("sourceCountry"),
                 "language": a.get("language"),
                 "domain": normalize_domain(url) or "unknown",
@@ -278,18 +298,26 @@ def fetch_gdelt_articles(
         )
 
     if not rows:
-        return pd.DataFrame(columns=EMPTY_COLUMNS), debug_info
+        return pd.DataFrame(columns=EMPTY_COLUMNS), dbg
 
     df = pd.DataFrame(rows)
+
+    # IMPORTANT: 여기서부터 "필터로 전부 날려버리는" 문제를 막기 위해 단계적 정제
+    # 1) title 없는 것만 제거
+    df = df[df["title"].fillna("").str.len() > 0]
+
+    # 2) published_utc 파싱 실패가 많으면 여기서 전부 날아갈 수 있으므로
+    #    우선 dropna를 하지 말고, 정렬 가능한 것만 우선 사용
     df["published_utc"] = pd.to_datetime(df["published_utc"], utc=True, errors="coerce")
-    df = df.dropna(subset=["published_utc"])
-    df = df[df["title"] != ""]
+
+    # 3) url 중복 제거는 유지
     df = df.drop_duplicates(subset=["url"], keep="first")
-    return df, debug_info
+
+    return df, dbg
 
 
 # -----------------------------
-# Summarization (same as before)
+# Summarization
 # -----------------------------
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def fetch_page_text_and_meta(url: str) -> Tuple[str, str]:
@@ -415,10 +443,17 @@ def jaccard(a: set, b: set) -> float:
 def dedup_by_title_cluster(df: pd.DataFrame, sim_threshold: float = 0.62) -> pd.DataFrame:
     if df is None or df.empty:
         return df
-    if "title" not in df.columns or "published_utc" not in df.columns:
+    if "title" not in df.columns:
         return df
 
-    dfx = df.copy().sort_values("published_utc", ascending=False)
+    # published_utc가 NaT일 수 있으니, 정렬키를 보정
+    dfx = df.copy()
+    if "published_utc" in dfx.columns:
+        dfx["_sort_key"] = dfx["published_utc"].fillna(pd.Timestamp.min.tz_localize("UTC"))
+        dfx = dfx.sort_values("_sort_key", ascending=False).drop(columns=["_sort_key"])
+    else:
+        dfx = dfx
+
     kept_idx: List[int] = []
     cluster_reps: List[set] = []
 
@@ -482,10 +517,13 @@ def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: boo
 
         pub_str = ""
         try:
-            pub_kst = pd.to_datetime(row.get("published_utc"), utc=True).tz_convert(KST)
-            pub_str = pub_kst.strftime("%Y-%m-%d %H:%M (KST)")
+            if pd.notna(row.get("published_utc")):
+                pub_kst = pd.to_datetime(row.get("published_utc"), utc=True).tz_convert(KST)
+                pub_str = pub_kst.strftime("%Y-%m-%d %H:%M (KST)")
+            else:
+                pub_str = "(시간 정보 없음)"
         except Exception:
-            pass
+            pub_str = "(시간 파싱 실패)"
 
         bullets: List[str] = row.get("bullets") or []
         meta_desc = row.get("meta_desc") or ""
@@ -528,35 +566,22 @@ def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: boo
 # UI
 # -----------------------------
 st.title("섹션별 주요 뉴스 Top 5 + 성향 분포 (전날 기준)")
-st.caption("전날 00:00~24:00(KST) 기준. 후보 0건 원인 진단을 위해 GDELT 응답 디버그를 강화했습니다.")
+st.caption("현재 문제는 API 응답은 오는데, 우리 쪽 파싱/필터에서 전부 제거되는 현상으로 보입니다. 이를 해결하기 위해 published_utc 파싱을 강화했습니다.")
 
 with st.sidebar:
-    st.header("1) 범위 선택")
     region = st.radio("국내/해외", options=["국내", "해외"], horizontal=True)
 
-    st.divider()
-    st.header("2) 섹션 선택")
     section_names = [s.section for s in SECTIONS]
-    selected_sections = st.multiselect(
-        "분석할 섹션(복수 선택 가능)",
-        options=section_names,
-        default=section_names,
-    )
+    selected_sections = st.multiselect("분석할 섹션", options=section_names, default=section_names)
 
-    st.divider()
-    st.header("3) Top 뉴스 구성")
     extra_keyword = st.text_input("추가 키워드(선택)", value="")
 
     top_n = st.number_input("섹션별 Top N", min_value=3, max_value=10, value=5, step=1)
-    candidate_pool = st.number_input("섹션별 후보 기사 수(수집량)", min_value=60, max_value=500, value=250, step=10)
+    candidate_pool = st.number_input("후보 기사 수", min_value=60, max_value=500, value=250, step=10)
 
-    st.divider()
-    st.header("품질 옵션")
-    enable_summary = st.toggle("3줄 핵심 bullet 요약", value=True)
-    sim_threshold = st.slider("중복 제거 유사도 임계값(Jaccard)", 0.45, 0.80, 0.62, 0.01)
+    enable_summary = st.toggle("3줄 요약", value=True)
+    sim_threshold = st.slider("중복 제거 임계값", 0.45, 0.80, 0.62, 0.01)
 
-    st.divider()
-    st.header("성향 매핑")
     uploaded = st.file_uploader("매핑 CSV 업로드 (domain,bias)", type=["csv"])
     if uploaded is not None:
         try:
@@ -583,114 +608,83 @@ with st.sidebar:
         if str(r.get("domain", "")).strip() and str(r.get("bias", "")).strip()
     }
 
-    st.divider()
-    debug = st.toggle("디버그 표시(요청 URL/응답 키/건수)", value=True)
-    run = st.button("전날 섹션별 Top 뉴스 생성", type="primary", use_container_width=True)
+    debug = st.toggle("디버그(응답 구조/샘플 키)", value=True)
+    run = st.button("전날 뉴스 생성", type="primary", use_container_width=True)
 
 if not run:
-    st.info("좌측에서 선택 후 실행하세요.")
-    st.stop()
-
-if not selected_sections:
-    st.warning("최소 1개 섹션을 선택해야 합니다.")
     st.stop()
 
 start_utc, end_utc = yesterday_kst_range_utc()
 start_kst = start_utc.astimezone(KST)
 end_kst = end_utc.astimezone(KST)
-
-st.markdown(f"### {region} · 섹션별 Top {int(top_n)}")
 st.caption(f"수집 기간: {start_kst.strftime('%Y-%m-%d %H:%M')} ~ {end_kst.strftime('%Y-%m-%d %H:%M')} (KST)")
 
+# 연결 테스트
+with st.expander("진단: 연결 테스트", expanded=True):
+    try:
+        df_t, dbg_t = fetch_gdelt_articles('"Korea"', start_utc, end_utc, 5)
+        st.write("status_code:", dbg_t.get("status_code"))
+        st.write("articles_count:", dbg_t.get("articles_count"))
+        st.write("top_keys:", dbg_t.get("top_keys"))
+        st.write("sample_article_keys:", dbg_t.get("sample_article_keys"))
+        st.write("sample_published_raw:", dbg_t.get("sample_published_raw"))
+        st.write("final_url:", dbg_t.get("final_url"))
+        st.write("df rows (after parsing):", len(df_t))
+        if not df_t.empty:
+            st.dataframe(df_t[["published_raw", "published_utc", "domain", "title", "url"]], use_container_width=True)
+        else:
+            st.warning("DataFrame이 비어 있습니다. sample_published_raw가 어떤 형태인지 확인하세요.")
+    except Exception as e:
+        st.error(f"연결 테스트 실패: {repr(e)}")
 
-# -----------------------------
-# Connectivity self-test (3단계)
-# -----------------------------
-with st.expander("진단: GDELT 연결 테스트 (3단계)", expanded=True):
-    tests = [
-        ('"Korea"', '언어 필터 없음'),
-        ('sourcelang:eng "Korea"', '영어 소스 필터'),
-        ('domain:cnn.com "Korea"', '도메인 필터'),
-    ]
-
-    for q, label in tests:
-        st.markdown(f"- **{label}**: <code class='small'>{escape_html(q)}</code>", unsafe_allow_html=True)
-        try:
-            df_t, dbg = fetch_gdelt_articles(
-                query=q,
-                start_dt_utc=start_utc,
-                end_dt_utc=end_utc,
-                max_records=5,
-            )
-            if debug:
-                st.write(
-                    {
-                        "status_code": dbg.get("status_code"),
-                        "articles_count": dbg.get("articles_count"),
-                        "error": dbg.get("error"),
-                        "message": dbg.get("message"),
-                        "top_keys": dbg.get("top_keys"),
-                    }
-                )
-                st.write("final_url:", dbg.get("final_url"))
-
-            st.write("rows:", len(df_t))
-            if not df_t.empty:
-                st.dataframe(df_t[["published_utc", "domain", "title", "url"]], use_container_width=True)
-        except Exception as e:
-            st.error(f"호출 실패: {repr(e)}")
-
-
-# -----------------------------
-# Main processing
-# -----------------------------
+# 섹션 처리
 section_cfg_map: Dict[str, SectionQuery] = {s.section: s for s in SECTIONS}
 results: Dict[str, Dict[str, Any]] = {}
 
-with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
+with st.spinner("섹션별 수집/정제 중..."):
     for sec_name in selected_sections:
         cfg = section_cfg_map[sec_name]
-        query_candidates = build_section_query_candidates(region, cfg, extra_keyword)
+        cands = build_section_query_candidates(region, cfg, extra_keyword)
 
         df = pd.DataFrame(columns=EMPTY_COLUMNS)
-        used_q = query_candidates[0]
-        used_dbg: Dict[str, Any] = {}
+        used_q = cands[0]
+        used_dbg = {}
+        last_exc = None
 
-        for cand_q in query_candidates:
-            used_q = cand_q
+        for q in cands:
+            used_q = q
             try:
-                df_try, dbg_try = fetch_gdelt_articles(
-                    query=cand_q,
-                    start_dt_utc=start_utc,
-                    end_dt_utc=end_utc,
-                    max_records=int(candidate_pool),
-                )
-            except Exception:
+                df_try, dbg_try = fetch_gdelt_articles(q, start_utc, end_utc, int(candidate_pool))
+                used_dbg = dbg_try
+                last_exc = None
+            except Exception as e:
                 df_try = pd.DataFrame(columns=EMPTY_COLUMNS)
-                dbg_try = {"status_code": None, "final_url": None, "top_keys": None, "error": None, "message": None, "articles_count": None}
-
-            used_dbg = dbg_try
+                dbg_try = {}
+                used_dbg = dbg_try
+                last_exc = repr(e)
 
             if debug:
-                st.write(f"[DEBUG] {sec_name} query = {cand_q}")
-                st.write(f"[DEBUG] {sec_name} status={dbg_try.get('status_code')} articles={dbg_try.get('articles_count')}")
-                st.write(f"[DEBUG] {sec_name} final_url = {dbg_try.get('final_url')}")
-                if dbg_try.get("error") or dbg_try.get("message"):
-                    st.write(f"[DEBUG] {sec_name} error/message =", {"error": dbg_try.get("error"), "message": dbg_try.get("message")})
+                st.write(f"[DEBUG] {sec_name} query = {q}")
+                if used_dbg:
+                    st.write(
+                        {
+                            "status_code": used_dbg.get("status_code"),
+                            "articles_count": used_dbg.get("articles_count"),
+                            "sample_published_raw": used_dbg.get("sample_published_raw"),
+                        }
+                    )
+                    st.write("final_url:", used_dbg.get("final_url"))
+                if last_exc:
+                    st.write("[DEBUG] exception:", last_exc)
+                st.write(f"[DEBUG] df_try rows(after parsing)={len(df_try)}")
 
             if not df_try.empty:
                 df = df_try
                 break
 
         df = apply_bias_mapping(df, mapping_dict)
-        df_dedup = dedup_by_title_cluster(df, sim_threshold=float(sim_threshold))
 
-        if df_dedup is None or "published_utc" not in df_dedup.columns:
-            df_dedup = df.head(0).copy()
-
-        if not df_dedup.empty:
-            df_dedup = df_dedup.sort_values("published_utc", ascending=False)
-
+        df_dedup = dedup_by_title_cluster(df, float(sim_threshold))
         top_df = df_dedup.head(int(top_n)).copy()
 
         if enable_summary and not top_df.empty:
@@ -707,63 +701,31 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
         dist_df = distribution(df_dedup)
 
         results[sec_name] = {
+            "query": used_q,
+            "dbg": used_dbg,
             "candidates": df_dedup,
             "top": top_df,
             "dist": dist_df,
-            "query": used_q,
-            "dbg": used_dbg,
         }
 
-
-# -----------------------------
-# Render
-# -----------------------------
 tabs = st.tabs(selected_sections)
 for tab, sec_name in zip(tabs, selected_sections):
     with tab:
-        used_q = results[sec_name]["query"]
-        st.markdown(f"<small class='muted'>최종 사용 쿼리: {escape_html(clean_text(used_q))}</small>", unsafe_allow_html=True)
-
-        if debug:
-            dbg = results[sec_name].get("dbg", {})
-            st.write(
-                {
-                    "status_code": dbg.get("status_code"),
-                    "articles_count": dbg.get("articles_count"),
-                    "error": dbg.get("error"),
-                    "message": dbg.get("message"),
-                    "top_keys": dbg.get("top_keys"),
-                }
-            )
-            st.write("final_url:", dbg.get("final_url"))
+        st.markdown(f"<small class='muted'>최종 사용 쿼리: {escape_html(results[sec_name]['query'])}</small>", unsafe_allow_html=True)
 
         cands = results[sec_name]["candidates"]
         dist_df = results[sec_name]["dist"]
 
         c1, c2, c3 = st.columns(3)
-        c1.metric("후보 기사(중복 제거 후)", f"{len(cands):,}" if cands is not None else "0")
-        unknown_share = dist_df.loc[dist_df["bias"] == "미분류", "share"].sum() if dist_df is not None and not dist_df.empty else 0
+        c1.metric("후보(중복 제거 후)", f"{len(cands):,}")
+        unknown_share = dist_df.loc[dist_df["bias"] == "미분류", "share"].sum() if not dist_df.empty else 0
         c2.metric("미분류 비율", f"{unknown_share*100:.1f}%")
-        c3.metric("고유 도메인", f"{cands['domain'].nunique(dropna=True):,}" if cands is not None and not cands.empty and "domain" in cands.columns else "0")
+        c3.metric("고유 도메인", f"{cands['domain'].nunique(dropna=True):,}" if not cands.empty else "0")
 
-        if dist_df is not None and not dist_df.empty:
+        if not dist_df.empty:
             fig = px.bar(dist_df, x="bias", y="count", text=dist_df["share"].map(lambda x: f"{x*100:.1f}%"))
             fig.update_layout(xaxis_title="성향", yaxis_title="기사 수", showlegend=False, height=320)
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("성향 분포를 만들 데이터가 없습니다.")
 
         st.divider()
         render_top_list(sec_name, results[sec_name]["top"], enable_summary)
-
-        with st.expander("진단: 후보 기사(중복 제거 후) 미리보기", expanded=False):
-            if cands is None or cands.empty:
-                st.write("후보 기사가 없습니다.")
-            else:
-                cols = [c for c in ["published_utc", "bias", "domain", "title", "url", "language", "sourceCountry"] if c in cands.columns]
-                st.dataframe(cands[cols].head(60), use_container_width=True, height=420)
-
-st.caption(
-    "후보/테스트가 계속 0이면, 상단 ‘GDELT 연결 테스트’의 status_code, final_url, top_keys, error/message를 기준으로 "
-    "환경 문제(DNS/TLS/outbound)인지, 파라미터/응답 형식 문제인지 바로 갈라집니다."
-)
