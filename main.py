@@ -2,7 +2,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import pandas as pd
 import requests
@@ -17,7 +17,7 @@ import plotly.express as px
 # Page Config
 # -----------------------------
 st.set_page_config(
-    page_title="섹션별 Top 5 + 성향 분포 (전날 기준 / Fallback Query)",
+    page_title="섹션별 Top 5 + 성향 분포 (전날 기준 / Debug 강화)",
     page_icon="🗞️",
     layout="wide",
 )
@@ -40,6 +40,7 @@ small.muted { color: rgba(49,51,63,.65); }
 .badge { display:inline-block; padding:2px 8px; border-radius: 999px; border:1px solid rgba(49,51,63,.18); font-size:.82rem;}
 hr.soft { border: none; border-top: 1px solid rgba(49,51,63,.10); margin: 14px 0; }
 ul.tight { margin: 0.2rem 0 0.2rem 1.2rem; }
+code.small { font-size: 0.85rem; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -52,11 +53,10 @@ KST = timezone(timedelta(hours=9))
 UTC = timezone.utc
 
 GDELT_DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
-USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/2.4; +https://streamlit.io)"
-REQUEST_TIMEOUT = 12  # seconds
+USER_AGENT = "Mozilla/5.0 (compatible; StreamlitSectionTop5/2.5; +https://streamlit.io)"
+REQUEST_TIMEOUT = 15  # seconds
 
 BIAS_ORDER = ["보수", "중도", "진보", "미분류"]
-
 EMPTY_COLUMNS = ["title", "url", "seendate", "published_utc", "sourceCountry", "language", "domain"]
 
 
@@ -66,11 +66,11 @@ EMPTY_COLUMNS = ["title", "url", "seendate", "published_utc", "sourceCountry", "
 @dataclass(frozen=True)
 class SectionQuery:
     section: str
-    # NOTE: DOC 검색 안정성을 위해 국내/해외 모두 영어 키워드 기반으로 구성
     domestic_query: str
     overseas_query: str
 
 
+# NOTE: DOC 검색 안정성을 위해 국내/해외 모두 영어 키워드 기반
 SECTIONS: List[SectionQuery] = [
     SectionQuery(
         section="정치",
@@ -101,11 +101,10 @@ SECTIONS: List[SectionQuery] = [
 
 
 # -----------------------------
-# Bias mapping (starter; user-editable)
+# Bias mapping
 # -----------------------------
 def default_bias_mapping_df() -> pd.DataFrame:
     data = [
-        # Korea (illustrative)
         ("chosun.com", "보수"),
         ("donga.com", "보수"),
         ("joongang.co.kr", "중도"),
@@ -113,7 +112,6 @@ def default_bias_mapping_df() -> pd.DataFrame:
         ("yonhapnews.co.kr", "중도"),
         ("hani.co.kr", "진보"),
         ("khan.co.kr", "진보"),
-        # Global (illustrative)
         ("reuters.com", "중도"),
         ("apnews.com", "중도"),
         ("bbc.co.uk", "중도"),
@@ -166,7 +164,7 @@ def parse_seendate_utc(s: str) -> Optional[datetime]:
 
 def yesterday_kst_range_utc() -> Tuple[datetime, datetime]:
     """
-    전날 00:00 ~ 오늘 00:00 (KST) 범위를 UTC로 변환.
+    전날 00:00 ~ 오늘 00:00 (KST) 범위를 UTC로 변환
     """
     now_kst = datetime.now(KST)
     today_start_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -176,43 +174,41 @@ def yesterday_kst_range_utc() -> Tuple[datetime, datetime]:
 
 
 # -----------------------------
-# Query builder: candidate queries with fallback
+# Query builder: candidates with fallback
 # -----------------------------
 def build_section_query_candidates(region: str, section_cfg: SectionQuery, extra_keyword: str) -> List[str]:
-    """
-    - 1차: extra_keyword 포함
-    - 2차: extra_keyword 제거 (0건 방지 fallback)
-    - 언어 연산자 sourcelang 값이 케이스/코드에 민감할 수 있어 다중 후보를 순차 시도
-    """
     extra = clean_text(extra_keyword)
 
+    # extra 포함 -> (0이면) extra 제거
     extra_parts = []
     if extra:
         extra_parts.append(f'("{extra}")')
-    extra_parts.append("")  # fallback: extra 제거
+    extra_parts.append("")
 
     queries: List[str] = []
 
     if region == "국내":
-        # 한국어 소스 + 영어 키워드
         lang_candidates = ["sourcelang:kor", "sourcelang:korean", "sourcelang:Korean"]
         for lang in lang_candidates:
             for extra_part in extra_parts:
-                q = f"{lang} {section_cfg.domestic_query} {extra_part}".strip()
-                queries.append(q)
+                queries.append(f"{lang} {section_cfg.domestic_query} {extra_part}".strip())
+        # 최후 폴백: 언어 제한 제거
+        for extra_part in extra_parts:
+            queries.append(f"{section_cfg.domestic_query} {extra_part}".strip())
         return queries
 
-    # 해외: 영어 소스 + 영어 키워드
+    # 해외
     lang_candidates = ["sourcelang:eng", "sourcelang:english", "sourcelang:English"]
     for lang in lang_candidates:
         for extra_part in extra_parts:
-            q = f"{lang} {section_cfg.overseas_query} {extra_part}".strip()
-            queries.append(q)
+            queries.append(f"{lang} {section_cfg.overseas_query} {extra_part}".strip())
+    for extra_part in extra_parts:
+        queries.append(f"{section_cfg.overseas_query} {extra_part}".strip())
     return queries
 
 
 # -----------------------------
-# GDELT fetch
+# GDELT fetch (Debug 강화)
 # -----------------------------
 @st.cache_data(ttl=60 * 10, show_spinner=False)
 def fetch_gdelt_articles(
@@ -220,24 +216,51 @@ def fetch_gdelt_articles(
     start_dt_utc: datetime,
     end_dt_utc: datetime,
     max_records: int,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Returns (df, debug_info)
+    debug_info includes status_code, final_url, top-level keys, error/message (if present), articles_count
+    """
     def fmt(dt: datetime) -> str:
         return dt.astimezone(UTC).strftime("%Y%m%d%H%M%S")
 
     params = {
         "query": query,
-        "mode": "ArtList",
+        # IMPORTANT: mode는 예시대로 소문자 사용
+        "mode": "artlist",
         "format": "json",
         "maxrecords": int(max_records),
-        "sort": "HybridRel",
+        # 날짜 확인 편의: 최신순
+        "sort": "datedesc",
         "startdatetime": fmt(start_dt_utc),
         "enddatetime": fmt(end_dt_utc),
     }
 
     headers = {"User-Agent": USER_AGENT}
+
+    debug_info: Dict[str, Any] = {
+        "status_code": None,
+        "final_url": None,
+        "top_keys": None,
+        "error": None,
+        "message": None,
+        "articles_count": None,
+    }
+
     r = requests.get(GDELT_DOC_ENDPOINT, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+    debug_info["status_code"] = r.status_code
+    debug_info["final_url"] = r.url
+
     r.raise_for_status()
     data = r.json()
+
+    if isinstance(data, dict):
+        debug_info["top_keys"] = sorted(list(data.keys()))
+        debug_info["error"] = data.get("error")
+        debug_info["message"] = data.get("message")
+        debug_info["articles_count"] = len(data.get("articles", []) or [])
+    else:
+        debug_info["top_keys"] = [type(data).__name__]
 
     rows = []
     for a in (data.get("articles", []) or []):
@@ -255,18 +278,18 @@ def fetch_gdelt_articles(
         )
 
     if not rows:
-        return pd.DataFrame(columns=EMPTY_COLUMNS)
+        return pd.DataFrame(columns=EMPTY_COLUMNS), debug_info
 
     df = pd.DataFrame(rows)
     df["published_utc"] = pd.to_datetime(df["published_utc"], utc=True, errors="coerce")
     df = df.dropna(subset=["published_utc"])
     df = df[df["title"] != ""]
     df = df.drop_duplicates(subset=["url"], keep="first")
-    return df
+    return df, debug_info
 
 
 # -----------------------------
-# Summarization: 3 bullets + fallback meta
+# Summarization (same as before)
 # -----------------------------
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def fetch_page_text_and_meta(url: str) -> Tuple[str, str]:
@@ -352,18 +375,16 @@ def summarize_3_bullets(page_text: str, meta_desc: str) -> List[str]:
 
 
 # -----------------------------
-# Dedup clustering (token Jaccard) - SAFE
+# Dedup clustering (SAFE)
 # -----------------------------
 STOPWORDS_KO = set(
     "그리고 그러나 또한 때문에 통해 관련 대한 따르면 경우 이번 오늘 내일 어제 기자 단독 속보 "
-    "영상 사진 발표 밝혔다 말했다 예정 진행 가능 확대 감소 증가 정부 국회 대통령 "
-    .split()
+    "영상 사진 발표 밝혔다 말했다 예정 진행 가능 확대 감소 증가 정부 국회 대통령 ".split()
 )
 STOPWORDS_EN = set(
     "the a an and or but if then than this that those these to of in on for with without "
     "as from by at is are was were be been being it its into about after before over under "
-    "says said say will would could should may might "
-    .split()
+    "says said say will would could should may might ".split()
 )
 
 
@@ -398,7 +419,6 @@ def dedup_by_title_cluster(df: pd.DataFrame, sim_threshold: float = 0.62) -> pd.
         return df
 
     dfx = df.copy().sort_values("published_utc", ascending=False)
-
     kept_idx: List[int] = []
     cluster_reps: List[set] = []
 
@@ -424,7 +444,7 @@ def dedup_by_title_cluster(df: pd.DataFrame, sim_threshold: float = 0.62) -> pd.
 
 
 # -----------------------------
-# Bias mapping apply + distribution
+# Bias mapping + distribution
 # -----------------------------
 def apply_bias_mapping(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
     if df is None or df.empty:
@@ -451,7 +471,7 @@ def distribution(df: pd.DataFrame) -> pd.DataFrame:
 def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: bool):
     st.subheader(f"{section_name} · Top {len(top_df)}")
     if top_df is None or top_df.empty:
-        st.warning("해당 섹션에서 기사 후보를 찾지 못했습니다. (기간/키워드/범위 조정 필요)")
+        st.warning("해당 섹션에서 기사 후보를 찾지 못했습니다.")
         return
 
     for idx, row in top_df.reset_index(drop=True).iterrows():
@@ -476,7 +496,7 @@ def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: boo
             elif meta_desc:
                 summary_html = f"<small class='muted'>{escape_html(meta_desc)}</small>"
             else:
-                summary_html = "<small class='muted'>요약을 불러오지 못했습니다(사이트 차단/메타정보/본문 부재 가능).</small>"
+                summary_html = "<small class='muted'>요약을 불러오지 못했습니다(차단/본문 부재 가능).</small>"
         else:
             summary_html = "<small class='muted'>요약 기능이 꺼져 있습니다.</small>"
 
@@ -508,7 +528,7 @@ def render_top_list(section_name: str, top_df: pd.DataFrame, enable_summary: boo
 # UI
 # -----------------------------
 st.title("섹션별 주요 뉴스 Top 5 + 성향 분포 (전날 기준)")
-st.caption("전날(어제) 00:00~24:00(KST) 기준 섹션별 Top 5를 ‘중복 제거 + 3줄 요약’으로 정리하고, 섹션별 성향 분포를 함께 보여줍니다. (GDELT DOC API)")
+st.caption("전날 00:00~24:00(KST) 기준. 후보 0건 원인 진단을 위해 GDELT 응답 디버그를 강화했습니다.")
 
 with st.sidebar:
     st.header("1) 범위 선택")
@@ -525,34 +545,15 @@ with st.sidebar:
 
     st.divider()
     st.header("3) Top 뉴스 구성")
-    extra_keyword = st.text_input(
-        "추가 키워드(선택)",
-        value="",
-        help="주의: DOC 검색은 영어 키워드가 안정적입니다. 한글 키워드는 0건이 될 수 있어 자동 fallback이 동작합니다.",
-    )
+    extra_keyword = st.text_input("추가 키워드(선택)", value="")
 
     top_n = st.number_input("섹션별 Top N", min_value=3, max_value=10, value=5, step=1)
-
-    candidate_pool = st.number_input(
-        "섹션별 후보 기사 수(수집량)",
-        min_value=60,
-        max_value=500,
-        value=250,
-        step=10,
-        help="Top N을 뽑기 전 GDELT에서 가져오는 후보 기사 수입니다.",
-    )
+    candidate_pool = st.number_input("섹션별 후보 기사 수(수집량)", min_value=60, max_value=500, value=250, step=10)
 
     st.divider()
     st.header("품질 옵션")
     enable_summary = st.toggle("3줄 핵심 bullet 요약", value=True)
-    sim_threshold = st.slider(
-        "중복 제거 유사도 임계값(Jaccard)",
-        min_value=0.45,
-        max_value=0.80,
-        value=0.62,
-        step=0.01,
-        help="값이 높을수록 ‘거의 같은 제목’만 중복으로 제거합니다.",
-    )
+    sim_threshold = st.slider("중복 제거 유사도 임계값(Jaccard)", 0.45, 0.80, 0.62, 0.01)
 
     st.divider()
     st.header("성향 매핑")
@@ -583,12 +584,11 @@ with st.sidebar:
     }
 
     st.divider()
-    debug = st.toggle("디버그 표시(쿼리/건수)", value=False)
-
+    debug = st.toggle("디버그 표시(요청 URL/응답 키/건수)", value=True)
     run = st.button("전날 섹션별 Top 뉴스 생성", type="primary", use_container_width=True)
 
 if not run:
-    st.info("좌측에서 범위/섹션/옵션을 선택한 뒤 실행하세요.")
+    st.info("좌측에서 선택 후 실행하세요.")
     st.stop()
 
 if not selected_sections:
@@ -600,50 +600,66 @@ start_kst = start_utc.astimezone(KST)
 end_kst = end_utc.astimezone(KST)
 
 st.markdown(f"### {region} · 섹션별 Top {int(top_n)}")
-st.caption(f"수집 기간: {start_kst.strftime('%Y-%m-%d %H:%M')} ~ {end_kst.strftime('%Y-%m-%d %H:%M')} (KST, 전날 기준)")
+st.caption(f"수집 기간: {start_kst.strftime('%Y-%m-%d %H:%M')} ~ {end_kst.strftime('%Y-%m-%d %H:%M')} (KST)")
 
 
 # -----------------------------
-# Connectivity self-test
+# Connectivity self-test (3단계)
 # -----------------------------
-with st.expander("진단: GDELT 연결 테스트", expanded=False):
-    try:
-        # 아주 단순한 테스트 쿼리 (전날 범위 내)
-        test_df = fetch_gdelt_articles(
-            query='sourcelang:eng "Korea"',
-            start_dt_utc=start_utc,
-            end_dt_utc=end_utc,
-            max_records=5,
-        )
-        st.write("GDELT 응답 rows:", len(test_df))
-        if not test_df.empty:
-            st.dataframe(test_df[["published_utc", "domain", "title", "url"]], use_container_width=True)
-        else:
-            st.info("테스트 쿼리도 0건입니다. (환경/네트워크 문제 또는 기간/쿼리 문제 가능)")
-    except Exception as e:
-        st.error(f"GDELT 호출 실패: {repr(e)}")
-        st.info("이 경우, Streamlit Cloud의 outbound 네트워크/DNS/TLS 이슈 가능성이 큽니다.")
+with st.expander("진단: GDELT 연결 테스트 (3단계)", expanded=True):
+    tests = [
+        ('"Korea"', '언어 필터 없음'),
+        ('sourcelang:eng "Korea"', '영어 소스 필터'),
+        ('domain:cnn.com "Korea"', '도메인 필터'),
+    ]
+
+    for q, label in tests:
+        st.markdown(f"- **{label}**: <code class='small'>{escape_html(q)}</code>", unsafe_allow_html=True)
+        try:
+            df_t, dbg = fetch_gdelt_articles(
+                query=q,
+                start_dt_utc=start_utc,
+                end_dt_utc=end_utc,
+                max_records=5,
+            )
+            if debug:
+                st.write(
+                    {
+                        "status_code": dbg.get("status_code"),
+                        "articles_count": dbg.get("articles_count"),
+                        "error": dbg.get("error"),
+                        "message": dbg.get("message"),
+                        "top_keys": dbg.get("top_keys"),
+                    }
+                )
+                st.write("final_url:", dbg.get("final_url"))
+
+            st.write("rows:", len(df_t))
+            if not df_t.empty:
+                st.dataframe(df_t[["published_utc", "domain", "title", "url"]], use_container_width=True)
+        except Exception as e:
+            st.error(f"호출 실패: {repr(e)}")
 
 
 # -----------------------------
 # Main processing
 # -----------------------------
 section_cfg_map: Dict[str, SectionQuery] = {s.section: s for s in SECTIONS}
-results: Dict[str, Dict[str, pd.DataFrame]] = {}
+results: Dict[str, Dict[str, Any]] = {}
 
 with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
     for sec_name in selected_sections:
         cfg = section_cfg_map[sec_name]
-
         query_candidates = build_section_query_candidates(region, cfg, extra_keyword)
 
         df = pd.DataFrame(columns=EMPTY_COLUMNS)
         used_q = query_candidates[0]
+        used_dbg: Dict[str, Any] = {}
 
         for cand_q in query_candidates:
             used_q = cand_q
             try:
-                df_try = fetch_gdelt_articles(
+                df_try, dbg_try = fetch_gdelt_articles(
                     query=cand_q,
                     start_dt_utc=start_utc,
                     end_dt_utc=end_utc,
@@ -651,17 +667,22 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
                 )
             except Exception:
                 df_try = pd.DataFrame(columns=EMPTY_COLUMNS)
+                dbg_try = {"status_code": None, "final_url": None, "top_keys": None, "error": None, "message": None, "articles_count": None}
+
+            used_dbg = dbg_try
 
             if debug:
                 st.write(f"[DEBUG] {sec_name} query = {cand_q}")
-                st.write(f"[DEBUG] {sec_name} fetched rows = {len(df_try)}")
+                st.write(f"[DEBUG] {sec_name} status={dbg_try.get('status_code')} articles={dbg_try.get('articles_count')}")
+                st.write(f"[DEBUG] {sec_name} final_url = {dbg_try.get('final_url')}")
+                if dbg_try.get("error") or dbg_try.get("message"):
+                    st.write(f"[DEBUG] {sec_name} error/message =", {"error": dbg_try.get("error"), "message": dbg_try.get("message")})
 
             if not df_try.empty:
                 df = df_try
                 break
 
         df = apply_bias_mapping(df, mapping_dict)
-
         df_dedup = dedup_by_title_cluster(df, sim_threshold=float(sim_threshold))
 
         if df_dedup is None or "published_utc" not in df_dedup.columns:
@@ -689,18 +710,32 @@ with st.spinner("섹션별 기사 후보를 수집/정제 중입니다..."):
             "candidates": df_dedup,
             "top": top_df,
             "dist": dist_df,
-            "query": pd.DataFrame([{"query": used_q}]),
+            "query": used_q,
+            "dbg": used_dbg,
         }
 
 
 # -----------------------------
-# Render tabs
+# Render
 # -----------------------------
 tabs = st.tabs(selected_sections)
 for tab, sec_name in zip(tabs, selected_sections):
     with tab:
-        used_q = results[sec_name]["query"].iloc[0]["query"]
+        used_q = results[sec_name]["query"]
         st.markdown(f"<small class='muted'>최종 사용 쿼리: {escape_html(clean_text(used_q))}</small>", unsafe_allow_html=True)
+
+        if debug:
+            dbg = results[sec_name].get("dbg", {})
+            st.write(
+                {
+                    "status_code": dbg.get("status_code"),
+                    "articles_count": dbg.get("articles_count"),
+                    "error": dbg.get("error"),
+                    "message": dbg.get("message"),
+                    "top_keys": dbg.get("top_keys"),
+                }
+            )
+            st.write("final_url:", dbg.get("final_url"))
 
         cands = results[sec_name]["candidates"]
         dist_df = results[sec_name]["dist"]
@@ -729,6 +764,6 @@ for tab, sec_name in zip(tabs, selected_sections):
                 st.dataframe(cands[cols].head(60), use_container_width=True, height=420)
 
 st.caption(
-    "주의: (1) 섹션 분류는 키워드 기반이며, (2) 요약은 웹페이지 접근 가능 범위에서만 생성됩니다. "
-    "후보가 계속 0이면 expander의 ‘GDELT 연결 테스트’ 결과(에러/0건 여부)를 기준으로 환경 문제인지 판단하세요."
+    "후보/테스트가 계속 0이면, 상단 ‘GDELT 연결 테스트’의 status_code, final_url, top_keys, error/message를 기준으로 "
+    "환경 문제(DNS/TLS/outbound)인지, 파라미터/응답 형식 문제인지 바로 갈라집니다."
 )
